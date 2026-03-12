@@ -1,7 +1,12 @@
 """
 enhanced_app.py  –  Resume → Skills → AI Interview → Evaluation
+Improvements:
+  1. Skills extracted via phrase-match + semantic similarity (sentence-transformers)
+  2. Questions generated for skills AND projects found in the resume
+  3. Questions are dynamic – different every run (session seed + high temperature)
+  4. Each question's model answer validated by a second AI model (Mixtral)
+     Confidence badge shown to student on every question
 """
-
 import os
 import streamlit as st
 from enhanced_skill_extractor import EnhancedSkillExtractor
@@ -15,7 +20,6 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
-
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap');
@@ -53,23 +57,43 @@ section[data-testid="stSidebar"] .stButton button {
     font-size: 0.78rem; font-weight: 600; background: #eef2ff;
     color: #4338ca; border: 1px solid #c7d2fe;
 }
+.skill-pill-semantic {
+    display: inline-block; padding: 4px 13px; margin: 3px; border-radius: 999px;
+    font-size: 0.78rem; font-weight: 600; background: #fdf4ff;
+    color: #7e22ce; border: 1px dashed #d8b4fe;
+}
 .skill-pill-cat {
     display: inline-block; padding: 2px 10px; margin: 2px; border-radius: 4px;
     font-size: 0.68rem; font-weight: 700; background: #f0fdf4;
     color: #16a34a; border: 1px solid #bbf7d0;
     text-transform: uppercase; letter-spacing: 0.06em;
 }
+.skill-pill-project {
+    display: inline-block; padding: 2px 10px; margin: 2px; border-radius: 4px;
+    font-size: 0.68rem; font-weight: 700; background: #fff7ed;
+    color: #c2410c; border: 1px solid #fdba74;
+    text-transform: uppercase; letter-spacing: 0.06em;
+}
 
 .q-card {
     background: linear-gradient(135deg, #eef2ff 0%, #f5f3ff 100%);
     border: 1.5px solid #c7d2fe; border-radius: 14px;
-    padding: 1.4rem 1.6rem; margin-bottom: 1rem;
+    padding: 1.4rem 1.6rem; margin-bottom: 0.6rem;
 }
 .q-meta { display: flex; gap: 8px; flex-wrap: wrap; font-size: 0.72rem; margin-bottom: 0.8rem; }
 .q-meta span { padding: 3px 10px; border-radius: 999px; font-weight: 600; }
 .q-num  { background: #4f46e5; color: white; }
 .q-skill { background: #7c3aed; color: white; }
 .q-text { font-size: 1.05rem; color: #1e1b4b; font-weight: 600; line-height: 1.65; }
+
+.confidence-badge {
+    border-radius: 8px; padding: 8px 14px; margin-bottom: 1rem;
+    font-size: 0.82rem; font-weight: 600;
+    display: flex; align-items: center; gap: 8px;
+}
+.confidence-high   { background: #f0fdf4; border: 1px solid #bbf7d0; color: #16a34a; }
+.confidence-medium { background: #fffbeb; border: 1px solid #fde68a; color: #d97706; }
+.confidence-low    { background: #fef2f2; border: 1px solid #fecaca; color: #dc2626; }
 
 .progress-bar-wrap { background: #e0e7ff; border-radius: 999px; height: 6px;
     margin-bottom: 1.2rem; overflow: hidden; }
@@ -129,6 +153,13 @@ section[data-testid="stSidebar"] .stButton button {
 .cat-track { background: #e0e7ff; border-radius: 999px; height: 10px; overflow: hidden; }
 .cat-fill { height: 10px; border-radius: 999px; }
 .section-divider { border: none; border-top: 1.5px solid #e0e7ff; margin: 1.2rem 0; }
+
+.legend-box {
+    display:flex; gap:16px; flex-wrap:wrap; align-items:center;
+    font-size:0.76rem; color:#475569; margin-bottom:1rem;
+    background:#f8fafc; border-radius:10px; padding:10px 14px;
+    border:1px solid #e2e8f0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -161,9 +192,37 @@ def grade_colors(grade):
     return GRADE.get(grade, GRADE["Error"])
 
 def diff_badge(d):
-    return {"easy":("#16a34a","#f0fdf4","#bbf7d0"),
-            "medium":("#d97706","#fffbeb","#fde68a"),
-            "hard":("#dc2626","#fef2f2","#fecaca")}.get(d, ("#64748b","#f8fafc","#e2e8f0"))
+    return {"easy":   ("#16a34a","#f0fdf4","#bbf7d0"),
+            "medium": ("#d97706","#fffbeb","#fde68a"),
+            "hard":   ("#dc2626","#fef2f2","#fecaca")}.get(d, ("#64748b","#f8fafc","#e2e8f0"))
+
+def render_confidence_badge(q: dict):
+    """Renders confidence badge below each non-project question card."""
+    # Project questions are subjective — no badge needed
+    if q.get("type") == "project":
+        return
+
+    confidence = q.get("confidence", "high")
+    similarity = q.get("similarity", 1.0)
+
+    conf_map = {
+        "high":   ("✅", "confidence-high",
+                   "Both AI models agree — answer is reliable"),
+        "medium": ("⚠️", "confidence-medium",
+                   "Models partially agreed — verify key points if unsure"),
+        "low":    ("🔴", "confidence-low",
+                   "Models disagreed — please verify this answer with your textbook"),
+    }
+    icon, css, message = conf_map.get(confidence, conf_map["high"])
+
+    st.markdown(
+        f'<div class="confidence-badge {css}">'
+        f'{icon}&nbsp;<b>Answer confidence: {confidence.upper()}</b>'
+        f'&nbsp;·&nbsp;Agreement score: {similarity}'
+        f'&nbsp;·&nbsp;{message}'
+        f'</div>',
+        unsafe_allow_html=True
+    )
 
 def render_score(score, grade):
     c, bg, border = grade_colors(grade)
@@ -212,8 +271,14 @@ def progress_bar(current, total):
 # ── Session state ─────────────────────────────────────────────────── #
 
 defaults = {
-    "stage":"upload", "skills_data":None, "questions":[],
-    "answers":{}, "evaluations":{}, "q_index":0,
+    "stage":              "upload",
+    "skills_data":        None,
+    "questions":          [],
+    "answers":            {},
+    "evaluations":        {},
+    "q_index":            0,
+    "resume_text":        "",
+    "last_uploaded_file": None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -288,7 +353,7 @@ if st.session_state.stage == "upload":
     st.markdown("""
     <div class="page-banner">
         <h1>AI Interview Coach</h1>
-        <p>Upload your resume · We extract your skills · AI asks the tough questions · You get scored</p>
+        <p>Upload your resume · Skills + projects extracted · AI asks the tough questions · You get scored</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown('<div class="content-card">', unsafe_allow_html=True)
@@ -297,6 +362,14 @@ if st.session_state.stage == "upload":
     uploaded_file = st.file_uploader("PDF, DOCX or TXT", type=["pdf","docx","txt"])
 
     if uploaded_file:
+        file_identity = (uploaded_file.name, uploaded_file.size)
+        if st.session_state.last_uploaded_file != file_identity:
+            st.session_state.questions    = []
+            st.session_state.answers      = {}
+            st.session_state.evaluations  = {}
+            st.session_state.q_index      = 0
+            st.session_state.last_uploaded_file = file_identity
+
         st.markdown(f"""
         <div style="background:#eef2ff;border:1.5px solid #c7d2fe;border-radius:10px;
                     padding:12px 16px;margin:10px 0;display:flex;
@@ -310,7 +383,7 @@ if st.session_state.stage == "upload":
 
         st.write("")
         if st.button("Extract Skills →", type="primary", use_container_width=True):
-            with st.spinner("Analysing resume with NLP…"):
+            with st.spinner("Analysing resume with NLP + semantic matching…"):
                 temp_dir  = "temp_uploads"
                 os.makedirs(temp_dir, exist_ok=True)
                 temp_path = os.path.join(temp_dir, uploaded_file.name)
@@ -323,7 +396,8 @@ if st.session_state.stage == "upload":
                     else:
                         skills_data = skill_extractor.extract_all_skills(text)
                         st.session_state.skills_data = skills_data
-                        st.session_state.stage = "configure"
+                        st.session_state.resume_text = text
+                        st.session_state.stage       = "configure"
                         st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -341,7 +415,7 @@ elif st.session_state.stage == "configure":
     st.markdown("""
     <div class="page-banner">
         <h1>Skills Detected</h1>
-        <p>Review what we found in your resume, then configure your interview session</p>
+        <p>Review what we found in your resume (phrase-match + semantic), then configure your session</p>
     </div>""", unsafe_allow_html=True)
 
     skills_data  = st.session_state.skills_data
@@ -349,12 +423,23 @@ elif st.session_state.stage == "configure":
 
     st.markdown('<div class="content-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">Skills Found</div>', unsafe_allow_html=True)
+
+    st.markdown("""
+    <div class="legend-box">
+        <span><span class="skill-pill">Skill</span> &nbsp;directly mentioned in resume</span>
+        <span><span class="skill-pill-semantic">Skill</span> &nbsp;inferred via semantic similarity</span>
+    </div>""", unsafe_allow_html=True)
+
     st.markdown(f"<p style='font-size:0.9rem;color:#475569;margin-bottom:1rem'>"
                 f"<b style='color:#1e1b4b'>{total_skills} skills</b> detected</p>",
                 unsafe_allow_html=True)
+
     for category, skills_list in skills_data["categories"].items():
         if skills_list:
-            pills = " ".join(f'<span class="skill-pill">{s["name"]}</span>' for s in skills_list)
+            pills = ""
+            for s in skills_list:
+                css_class = "skill-pill-semantic" if s.get("source") == "semantic" else "skill-pill"
+                pills += f'<span class="{css_class}">{s["name"]}</span> '
             st.markdown(
                 f'<div style="margin-bottom:0.9rem">'
                 f'<span class="skill-pill-cat">{category}</span>'
@@ -371,13 +456,19 @@ elif st.session_state.stage == "configure":
     with col2:
         q_per_skill = st.slider("Questions per Skill", 1, 3, 2)
 
+    include_projects = st.checkbox(
+        "🗂️  Include project-based questions (extracted from resume)",
+        value=True
+    )
+
     estimated = total_skills * q_per_skill
+    proj_note = " + project questions" if include_projects else ""
     st.markdown(f"""
     <div style="background:#eef2ff;border:1.5px solid #c7d2fe;border-radius:10px;
                 padding:12px 18px;margin:1rem 0;display:flex;align-items:center;gap:10px">
         <span style="font-size:1.2rem">📋</span>
         <span style="font-size:0.9rem;color:#3730a3">
-            <b>{estimated} questions</b> will be generated for this session
+            <b>~{estimated} questions</b>{proj_note} will be generated for this session
         </span>
     </div>""", unsafe_allow_html=True)
 
@@ -390,9 +481,16 @@ elif st.session_state.stage == "configure":
             if total_skills == 0:
                 st.warning("No skills found. Upload a more detailed resume.")
             else:
-                with st.spinner(f"AI is generating {estimated} questions…"):
+                with st.spinner("AI is generating and validating questions…"):
+                    resume_text_for_projects = (
+                        st.session_state.resume_text if include_projects else ""
+                    )
                     questions = question_gen.generate_questions(
-                        skills_data, difficulty=difficulty, questions_per_skill=q_per_skill)
+                        skills_data,
+                        difficulty=difficulty,
+                        questions_per_skill=q_per_skill,
+                        resume_text=resume_text_for_projects,
+                    )
                 if questions:
                     st.session_state.questions   = questions
                     st.session_state.q_index     = 0
@@ -429,10 +527,18 @@ elif st.session_state.stage == "interview":
     progress_bar(q_index, total)
 
     dc, dc_bg, dc_border = diff_badge(q.get("difficulty","medium"))
-    type_icon = {"conceptual":"💡","practical":"🔧","scenario":"🎬"}.get(q.get("type",""),"❓")
+    type_icon = {
+        "conceptual": "💡",
+        "practical":  "🔧",
+        "scenario":   "🎬",
+        "project":    "🗂️",
+    }.get(q.get("type",""), "❓")
+
+    card_bg    = "#fff7ed" if q.get("type") == "project" else "linear-gradient(135deg,#eef2ff 0%,#f5f3ff 100%)"
+    card_border= "#fdba74" if q.get("type") == "project" else "#c7d2fe"
 
     st.markdown(f"""
-    <div class="q-card">
+    <div class="q-card" style="background:{card_bg};border-color:{card_border}">
         <div class="q-meta">
             <span class="q-num">Q{q_index+1}</span>
             <span class="q-skill">{q.get('skill','')}</span>
@@ -447,6 +553,9 @@ elif st.session_state.stage == "interview":
         </div>
         <div class="q-text">{q.get('question','')}</div>
     </div>""", unsafe_allow_html=True)
+
+    # ── Confidence badge — shown below every non-project question ── #
+    render_confidence_badge(q)
 
     if q.get("hints"):
         if st.checkbox("💡 Show a hint", key=f"hint_{q_index}"):
@@ -628,9 +737,13 @@ elif st.session_state.stage == "results":
     st.markdown('<div class="content-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">Question-by-Question Review</div>', unsafe_allow_html=True)
     for idx, (ev, q) in enumerate(zip(ev_list, q_list)):
+        type_icon  = {"conceptual":"💡","practical":"🔧","scenario":"🎬","project":"🗂️"}.get(q.get("type",""),"❓")
+        confidence = q.get("confidence", "high")
+        conf_icon  = {"high":"✅","medium":"⚠️","low":"🔴"}.get(confidence, "✅")
         with st.expander(
-            f"Q{answered_qs[idx]+1}  ·  {q.get('skill','')}  ·  "
-            f"{ev['total_score']}/100  ·  {ev['grade']}"
+            f"{type_icon} Q{answered_qs[idx]+1}  ·  {q.get('skill','')}  ·  "
+            f"{ev['total_score']}/100  ·  {ev['grade']}  ·  "
+            f"{conf_icon} {confidence.capitalize()} confidence"
         ):
             st.markdown(f"**Question:** {q.get('question','')}")
             st.markdown(f"**Your Answer:** {st.session_state.answers.get(answered_qs[idx],'—')}")

@@ -2,7 +2,6 @@
 answer_evaluator.py
 Evaluates user answers to interview questions using Groq API.
 """
-
 import os
 import json
 import re
@@ -10,8 +9,8 @@ from groq import Groq
 from dotenv import load_dotenv
 load_dotenv()
 
-class AnswerEvaluator:
 
+class AnswerEvaluator:
     SCORING_RUBRIC = {
         "technical_accuracy": 40,
         "completeness":        30,
@@ -21,7 +20,7 @@ class AnswerEvaluator:
 
     def __init__(self):
         self.client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        self.model = "llama-3.3-70b-versatile"
+        self.model  = "llama-3.3-70b-versatile"
 
     # ------------------------------------------------------------------ #
     #  PUBLIC: evaluate a single answer                                    #
@@ -29,26 +28,21 @@ class AnswerEvaluator:
 
     def evaluate_answer(
         self,
-        question: str,
-        user_answer: str,
+        question:     str,
+        user_answer:  str,
         model_answer: str,
-        skill: str,
-        difficulty: str = "medium",
+        skill:        str,
+        difficulty:   str = "medium",
     ) -> dict:
         """
         Returns:
             {
-                "total_score":        int (0–100),
-                "grade":              str ("Excellent" | "Good" | "Average" | "Needs Improvement"),
-                "breakdown": {
-                    "technical_accuracy": int,
-                    "completeness":       int,
-                    "clarity":            int,
-                    "practical_insight":  int,
-                },
-                "strengths":          list[str],
-                "improvements":       list[str],
-                "detailed_feedback":  str,
+                "total_score":            int (0-100),
+                "grade":                  str,
+                "breakdown":              dict,
+                "strengths":              list[str],
+                "improvements":           list[str],
+                "detailed_feedback":      str,
                 "correct_answer_summary": str,
             }
         """
@@ -87,19 +81,19 @@ Return ONLY a valid JSON object (no markdown, no extra text):
   "improvements":           ["<point 1>", "<point 2>"],
   "detailed_feedback":      "<2-3 sentence constructive paragraph>",
   "correct_answer_summary": "<one sentence summary of the ideal answer>"
-}}
-"""
+}}"""
 
         try:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
                     {
-                        "role": "system",
-                        "content": "You are a strict but fair technical interviewer. Always respond with valid JSON only, no markdown, no extra text."
+                        "role":    "system",
+                        "content": "You are a strict but fair technical interviewer. "
+                                   "Always respond with valid JSON only, no markdown, no extra text."
                     },
                     {
-                        "role": "user",
+                        "role":    "user",
                         "content": prompt
                     }
                 ],
@@ -108,13 +102,13 @@ Return ONLY a valid JSON object (no markdown, no extra text):
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"^```(?:json)?", "", raw).strip()
-            raw = re.sub(r"```$", "", raw).strip()
+            raw = re.sub(r"```$",          "", raw).strip()
             result = json.loads(raw)
 
-            breakdown = result.get("breakdown", {})
-            total = sum(breakdown.values())
+            breakdown         = result.get("breakdown", {})
+            total             = sum(breakdown.values())
             result["total_score"] = total
-            result["grade"] = self._score_to_grade(total)
+            result["grade"]       = self._score_to_grade(total)
             return result
 
         except Exception as e:
@@ -122,18 +116,18 @@ Return ONLY a valid JSON object (no markdown, no extra text):
             return self._error_result()
 
     # ------------------------------------------------------------------ #
-    #  PUBLIC: evaluate ALL answers and compute session summary            #
+    #  PUBLIC: compute session summary                                     #
     # ------------------------------------------------------------------ #
 
-    def compute_session_summary(self, evaluations: list[dict], questions: list[dict]) -> dict:
-        """
-        Takes a list of evaluation results and their corresponding questions.
-        Returns an overall session report.
-        """
+    def compute_session_summary(
+        self,
+        evaluations: list[dict],
+        questions:   list[dict],
+    ) -> dict:
         if not evaluations:
             return {}
 
-        scores = [e.get("total_score", 0) for e in evaluations]
+        scores    = [e.get("total_score", 0) for e in evaluations]
         avg_score = round(sum(scores) / len(scores), 1)
 
         category_scores: dict[str, list[int]] = {}
@@ -149,7 +143,7 @@ Return ONLY a valid JSON object (no markdown, no extra text):
             for cat, s in category_scores.items()
         }
 
-        strengths = []
+        strengths    = []
         improvements = []
         for e in evaluations:
             strengths.extend(e.get("strengths", []))
@@ -172,28 +166,25 @@ Return ONLY a valid JSON object (no markdown, no extra text):
 
     @staticmethod
     def _score_to_grade(score: float) -> str:
-        if score >= 85:
-            return "Excellent"
-        if score >= 70:
-            return "Good"
-        if score >= 50:
-            return "Average"
+        if score >= 85: return "Excellent"
+        if score >= 70: return "Good"
+        if score >= 50: return "Average"
         return "Needs Improvement"
 
     @staticmethod
     def _empty_answer_result() -> dict:
         return {
             "total_score": 0,
-            "grade": "Needs Improvement",
-            "breakdown": {
+            "grade":       "Needs Improvement",
+            "breakdown":   {
                 "technical_accuracy": 0,
-                "completeness": 0,
-                "clarity": 0,
-                "practical_insight": 0,
+                "completeness":       0,
+                "clarity":            0,
+                "practical_insight":  0,
             },
-            "strengths": [],
-            "improvements": ["Please provide an answer to be evaluated."],
-            "detailed_feedback": "No answer was provided.",
+            "strengths":              [],
+            "improvements":           ["Please provide an answer to be evaluated."],
+            "detailed_feedback":      "No answer was provided.",
             "correct_answer_summary": "",
         }
 
@@ -201,10 +192,10 @@ Return ONLY a valid JSON object (no markdown, no extra text):
     def _error_result() -> dict:
         return {
             "total_score": 0,
-            "grade": "Error",
-            "breakdown": {},
-            "strengths": [],
-            "improvements": [],
-            "detailed_feedback": "Evaluation failed. Please try again.",
+            "grade":       "Error",
+            "breakdown":   {},
+            "strengths":   [],
+            "improvements":[],
+            "detailed_feedback":      "Evaluation failed. Please try again.",
             "correct_answer_summary": "",
         }

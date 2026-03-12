@@ -1,0 +1,7 @@
+# MCQ Module — Python dependencies
+# Install with: pip install -r requirements_mcq.txt
+
+streamlit>=1.32.0
+psycopg2-binary>=2.9.9   # PostgreSQL driver
+groq>=0.5.0              # LLaMA API
+pandas>=2.0.0            # Admin leaderboard table
