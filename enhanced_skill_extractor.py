@@ -1,551 +1,391 @@
-# enhanced_skill_extractor.py
-#
-# ─────────────────────────────────────────────────────────────────────────────
-# DESIGN PRINCIPLES
-# ─────────────────────────────────────────────────────────────────────────────
-#
-# 1. SKILL TAXONOMY — a skill is what an interviewer asks about.
-#    Tools/libraries/models are EVIDENCE of a skill, not skills themselves.
-#
-#    Tool/Library in resume        →  Canonical Skill extracted
-#    ──────────────────────────    ─────────────────────────────
-#    opencv, mediapipe, cv2        →  Computer Vision
-#    llama, mixtral, gpt, groq     →  Generative AI
-#    tesseract, tesseract.js       →  OCR
-#    tensorflow, pytorch, keras    →  Deep Learning
-#    scikit-learn, xgboost         →  Machine Learning
-#    android studio, android sdk   →  Android
-#    esp32, arduino, pyserial      →  IoT
-#    leetcode, geeksforgeeks       →  DSA
-#    pandas, numpy, matplotlib     →  Data Analysis
-#
-# 2. THREE-PASS PIPELINE
-#
-#    Pass 1 — Regex normalization
-#      • Curly apostrophes/quotes → straight
-#      • Standalone "C" (language) → "c language"
-#      • React.js → React, Node.JS → Node.js  etc.
-#      • OpenCV → opencv, MediaPipe → mediapipe  (alias casing)
-#      • Pre-split into clean paragraphs (fixes spaCy sentence segmentation)
-#
-#    Pass 2 — PhraseMatcher (spaCy, attr="LOWER")
-#      • Exact alias → canonical parent skill
-#      • Tagged source="explicit"
-#
-#    Pass 3 — Semantic similarity (sentence-transformers)
-#      Candidates built from THREE sources to maximize coverage:
-#        a) spaCy noun chunks of 2+ words     → threshold 0.78
-#        b) spaCy sentences (per paragraph)   → threshold 0.88
-#        c) Sliding window n-grams (4–8 words)→ threshold 0.82
-#           This is the KEY fix — catches phrases like:
-#           "Amazon's cloud platform for hosting" → AWS
-#           "packaging and shipping applications along with their dependencies" → Docker
-#           even when spaCy sentence segmentation is poor on resume text.
-#      Individual tokens EXCLUDED — single words cause false positives.
-#      Tagged source="semantic"
-#
-# ─────────────────────────────────────────────────────────────────────────────
+"""
+enhanced_skill_extractor.py
 
+LLaMA-based skill extractor — replaces NLP (spaCy + sentence-transformers).
+
+TWO THINGS EXTRACTED:
+  1. Skills — mapped to taxonomy categories
+  2. Projects — with technical skills used in each project
+
+WHY LLaMA INSTEAD OF NLP:
+  NLP relies on a hardcoded alias dictionary — misses anything not in the list.
+  LLaMA reads the full resume with language understanding:
+    "built REST APIs using Flask and deployed on EC2"
+    → Flask (Backend), REST API (Backend), AWS (Cloud & DevOps)
+    without needing EC2 in any alias list.
+
+OUTPUT:
+  {
+    "categories": {
+      "Programming Languages": [{"name": "Python", "source": "llm"}],
+      "Backend Development":   [{"name": "Flask",  "source": "llm"}],
+      ...
+    },
+    "total_skills": int,
+    "projects": [
+      {
+        "title":       "Face Recognition Attendance System",
+        "description": "Built using OpenCV and deep learning...",
+        "technologies": ["Python", "OpenCV", "Deep Learning"],
+        "highlights":   ["Achieved 95% accuracy", "Deployed on Raspberry Pi"],
+        "skill_context": {
+          "Computer Vision": "Used OpenCV and MediaPipe for face detection",
+          "Deep Learning":   "Trained CNN model for face recognition"
+        }
+      }
+    ]
+  }
+
+skill_context is the KEY addition — maps each skill to HOW it was used
+in the project, so question_generator can ask targeted questions.
+"""
+
+import os
 import re
-import spacy
-from spacy.matcher import PhraseMatcher
-from collections import defaultdict
+import json
+from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
-try:
-    from sentence_transformers import SentenceTransformer, util
-    _ST_AVAILABLE = True
-except ImportError:
-    _ST_AVAILABLE = False
-    print("WARNING: sentence-transformers not installed. "
-          "Run: pip install sentence-transformers")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SKILL TAXONOMY
+# ─────────────────────────────────────────────────────────────────────────────
+
+CATEGORY_DEFINITIONS = {
+    "Programming Languages": (
+        "Languages the candidate writes code in. "
+        "e.g. Python, Java, C++, JavaScript, TypeScript, Go, Kotlin, Swift, PHP, Dart, R"
+    ),
+    "Frontend Development": (
+        "UI and browser-side technologies. "
+        "e.g. React, Angular, Vue.js, Next.js, HTML, CSS, Bootstrap, Tailwind CSS, Redux, JavaScript"
+    ),
+    "Backend Development": (
+        "Server-side frameworks and API technologies. "
+        "e.g. Node.js, Express.js, Django, Flask, FastAPI, Spring Boot, REST API, GraphQL"
+    ),
+    "Databases": (
+        "Databases and data storage. "
+        "e.g. MySQL, PostgreSQL, MongoDB, SQLite, Redis, Firebase, SQL, DynamoDB"
+    ),
+    "Cloud & DevOps": (
+        "Cloud platforms, deployment, CI/CD, infrastructure. "
+        "e.g. AWS, Azure, Google Cloud, Docker, Kubernetes, Git, GitHub, Jenkins, CI/CD"
+    ),
+    "Data Science & AI": (
+        "ML, DL, AI, data analysis, computer vision, NLP, and related libraries. "
+        "e.g. Machine Learning, Deep Learning, Computer Vision, NLP, Generative AI, "
+        "Data Analysis, OCR"
+    ),
+    "Mobile Development": (
+        "Mobile app development. "
+        "e.g. Android, iOS, React Native, Flutter"
+    ),
+    "IoT & Hardware": (
+        "Embedded systems and hardware. "
+        "e.g. IoT, Arduino, ESP32, Raspberry Pi"
+    ),
+    "Tools & Platforms": (
+        "Developer tools and platforms. "
+        "e.g. VS Code, Postman, Figma, Jira, Linux, Bash"
+    ),
+    "DSA & CS Fundamentals": (
+        "Core CS concepts. "
+        "e.g. DSA, OOP, Operating Systems, DBMS, Networking, System Design"
+    ),
+    "Testing & QA": (
+        "Testing frameworks. "
+        "e.g. Unit Testing, Selenium, API Testing, pytest, Jest, TDD"
+    ),
+    "Soft Skills & Methodologies": (
+        "Non-technical skills. "
+        "e.g. Problem Solving, Leadership, Communication, Agile, Teamwork"
+    ),
+}
+
+CANONICAL_NAMES = {
+    "python": "Python", "java": "Java", "c++": "C++", "cpp": "C++",
+    "c language": "C", "javascript": "JavaScript", "typescript": "TypeScript",
+    "golang": "Go", "go": "Go", "kotlin": "Kotlin", "swift": "Swift",
+    "php": "PHP", "dart": "Dart", "scala": "Scala", "rust": "Rust",
+    "react": "React", "angular": "Angular", "vue": "Vue.js", "next.js": "Next.js",
+    "html": "HTML", "css": "CSS", "bootstrap": "Bootstrap",
+    "tailwind": "Tailwind CSS", "redux": "Redux",
+    "node.js": "Node.js", "nodejs": "Node.js", "express": "Express.js",
+    "django": "Django", "flask": "Flask", "fastapi": "FastAPI",
+    "spring boot": "Spring Boot", "graphql": "GraphQL", "rest api": "REST API",
+    "mysql": "MySQL", "postgresql": "PostgreSQL", "mongodb": "MongoDB",
+    "sqlite": "SQLite", "redis": "Redis", "firebase": "Firebase", "sql": "SQL",
+    "aws": "AWS", "azure": "Azure", "google cloud": "Google Cloud", "gcp": "Google Cloud",
+    "docker": "Docker", "kubernetes": "Kubernetes", "git": "Git",
+    "github": "GitHub", "jenkins": "Jenkins", "ci/cd": "CI/CD",
+    "machine learning": "Machine Learning", "ml": "Machine Learning",
+    "deep learning": "Deep Learning", "tensorflow": "Deep Learning",
+    "pytorch": "Deep Learning", "keras": "Deep Learning",
+    "computer vision": "Computer Vision", "opencv": "Computer Vision",
+    "mediapipe": "Computer Vision", "cv2": "Computer Vision",
+    "nlp": "NLP", "natural language processing": "NLP",
+    "generative ai": "Generative AI", "llm": "Generative AI", "genai": "Generative AI",
+    "gpt": "Generative AI", "llama": "Generative AI",
+    "ocr": "OCR", "tesseract": "OCR",
+    "data analysis": "Data Analysis", "pandas": "Data Analysis",
+    "numpy": "Data Analysis", "matplotlib": "Data Analysis",
+    "scikit-learn": "Machine Learning", "sklearn": "Machine Learning",
+    "android": "Android", "ios": "iOS", "react native": "React Native",
+    "flutter": "Flutter", "iot": "IoT", "arduino": "IoT", "esp32": "IoT",
+    "raspberry pi": "IoT", "vs code": "VS Code", "postman": "Postman",
+    "linux": "Linux", "bash": "Bash", "dsa": "DSA", "oop": "OOP",
+    "operating systems": "OS", "dbms": "DBMS", "networking": "Networking",
+    "system design": "System Design", "unit testing": "Unit Testing",
+    "pytest": "Unit Testing", "selenium": "Selenium",
+    "problem solving": "Problem Solving", "agile": "Agile",
+}
+
+# Fallback keyword scan used if API fails
+FALLBACK_KEYWORDS: dict[str, list[str]] = {
+    "Programming Languages": ["python","java","c++","javascript","typescript","kotlin","swift","php","dart"],
+    "Frontend Development":  ["react","angular","vue","html","css","bootstrap","tailwind"],
+    "Backend Development":   ["node.js","express","django","flask","fastapi","spring boot","rest api"],
+    "Databases":             ["mysql","postgresql","mongodb","sqlite","redis","sql","firebase"],
+    "Cloud & DevOps":        ["aws","azure","google cloud","docker","kubernetes","git","github","jenkins"],
+    "Data Science & AI":     ["machine learning","deep learning","tensorflow","pytorch","opencv",
+                               "nlp","generative ai","data analysis","pandas","numpy","ocr"],
+    "Mobile Development":    ["android","ios","react native","flutter"],
+    "IoT & Hardware":        ["iot","arduino","esp32","raspberry pi"],
+    "Tools & Platforms":     ["vs code","postman","figma","linux","bash"],
+    "DSA & CS Fundamentals": ["dsa","oop","operating systems","dbms","networking","system design"],
+    "Testing & QA":          ["unit testing","selenium","pytest","jest"],
+    "Soft Skills & Methodologies": ["problem solving","agile","teamwork","leadership"],
+}
 
 
 class EnhancedSkillExtractor:
-
-    NOUN_CHUNK_THRESHOLD  = 0.78   # 2+ word noun chunks
-    SENTENCE_THRESHOLD    = 0.88   # full sentences (strict — sentence is long)
-    NGRAM_THRESHOLD       = 0.82   # sliding window n-grams (4–8 words)
-
-    NGRAM_MIN = 4   # minimum words in sliding window
-    NGRAM_MAX = 8   # maximum words in sliding window
+    """
+    LLaMA-powered skill + project extractor.
+    Drop-in replacement for NLP-based extractor.
+    Returns same dict shape + projects list.
+    """
 
     def __init__(self):
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if not api_key:
             raise RuntimeError(
-                "spaCy model not found. Run: python -m spacy download en_core_web_sm"
+                "GROQ_API_KEY not found. Add it to your .env or .secrets.toml."
             )
-
-        self.matcher = PhraseMatcher(self.nlp.vocab, attr="LOWER")
-        self.skills_db = self._build_skills_db()
-
-        self.skill_to_category: dict[str, str] = {}
-        self._all_skill_names:  list[str]      = []
-        self._create_patterns()
-
-        if _ST_AVAILABLE:
-            self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
-            self._skill_embeddings = self._st_model.encode(
-                self._all_skill_names, convert_to_tensor=True
-            )
-        else:
-            self._st_model         = None
-            self._skill_embeddings = None
-
-    # ─────────────────────────────────────────────────────────────────── #
-    #  SKILLS DATABASE                                                     #
-    # ─────────────────────────────────────────────────────────────────── #
-
-    def _build_skills_db(self) -> dict:
-        return {
-
-            "Programming Languages": {
-                "Python":       ["python", "python3", "python 3"],
-                "Java":         ["java", "jdk", "jre"],
-                "C++":          ["c++", "cpp", "c plus plus"],
-                "C":            ["c language", "c programming"],
-                "C#":           ["c#", "csharp", "c sharp"],
-                "JavaScript":   ["javascript", "js", "es6", "ecmascript"],
-                "TypeScript":   ["typescript", "ts"],
-                "Go":           ["golang", "go language"],
-                "Rust":         ["rust lang"],
-                "Kotlin":       ["kotlin"],
-                "Swift":        ["swift"],
-                "PHP":          ["php"],
-                "Ruby":         ["ruby", "ruby on rails"],
-                "Scala":        ["scala"],
-                "R":            ["r programming", "r language"],
-                "Dart":         ["dart"],
-            },
-
-            "Frontend Development": {
-                "React":        ["react", "reactjs", "react.js"],
-                "Angular":      ["angular", "angularjs"],
-                "Vue.js":       ["vue", "vuejs", "vue.js"],
-                "Next.js":      ["next.js", "nextjs"],
-                "Svelte":       ["svelte"],
-                "HTML":         ["html", "html5"],
-                "CSS":          ["css", "css3"],
-                "Bootstrap":    ["bootstrap"],
-                "Tailwind CSS": ["tailwind", "tailwindcss", "tailwind css"],
-                "Redux":        ["redux"],
-            },
-
-            "Backend Development": {
-                "Node.js":      ["node.js", "nodejs", "node"],
-                "Express.js":   ["express.js", "expressjs", "express"],
-                "Django":       ["django"],
-                "Flask":        ["flask"],
-                "FastAPI":      ["fastapi"],
-                "Spring Boot":  ["spring boot", "spring framework", "spring mvc"],
-                "Laravel":      ["laravel"],
-                "GraphQL":      ["graphql"],
-                "REST API":     ["rest api", "restful api", "restful",
-                                 "rest endpoints", "api development",
-                                 "web api", "http api"],
-            },
-
-            "Databases": {
-                "MySQL":        ["mysql"],
-                "PostgreSQL":   ["postgresql", "postgres"],
-                "MongoDB":      ["mongodb", "mongo"],
-                "SQLite":       ["sqlite"],
-                "Redis":        ["redis"],
-                "Oracle":       ["oracle", "oracle db"],
-                "SQL":          ["sql", "structured query language"],
-                "Elasticsearch":["elasticsearch", "elastic search"],
-                "DynamoDB":     ["dynamodb", "dynamo db"],
-                "Cassandra":    ["cassandra", "apache cassandra"],
-                "Firebase":     ["firebase", "firestore"],
-            },
-
-            "Cloud & DevOps": {
-                "AWS":      [
-                    "aws", "amazon web services",
-                    "amazon ec2", "amazon s3", "amazon lambda", "amazon rds",
-                    # descriptive phrases that mean AWS
-                    "amazon cloud", "amazon's cloud", "amazons cloud",
-                    "amazon cloud platform",
-                ],
-                "Azure":    ["azure", "microsoft azure"],
-                "Google Cloud": [
-                    "gcp", "google cloud", "google cloud platform",
-                    "genai study jam", "google cloud study jam",
-                ],
-                "Docker":   [
-                    "docker", "dockerfile", "docker compose",
-                    # descriptive phrases that mean Docker
-                    "containerization", "containers", "container platform",
-                    "packaging applications", "shipping applications",
-                    "packaging and shipping", "application containers",
-                    "run consistently across environments",
-                ],
-                "Kubernetes":["kubernetes", "k8s", "kubectl"],
-                "Terraform": ["terraform"],
-                "Ansible":   ["ansible"],
-                "Jenkins":   ["jenkins"],
-                "Git":       ["git"],
-                "GitHub":    ["github"],
-                "GitLab":    ["gitlab"],
-                "CI/CD":     ["ci/cd", "continuous integration",
-                              "continuous deployment", "continuous delivery",
-                              "github actions", "gitlab ci"],
-            },
-
-            "Data Science & AI": {
-                "Machine Learning": [
-                    "machine learning", "ml",
-                    "scikit-learn", "sklearn", "scikit learn",
-                    "xgboost", "lightgbm", "catboost",
-                    "python for data science",
-                ],
-                "Deep Learning": [
-                    "deep learning", "neural networks", "neural network",
-                    "cnn", "convolutional neural network",
-                    "rnn", "recurrent neural network",
-                    "lstm", "transformer model", "bert",
-                    "tensorflow", "tf.keras", "pytorch", "torch", "keras",
-                ],
-                "Computer Vision": [
-                    "computer vision", "image recognition",
-                    "object detection", "image processing",
-                    "hand gesture recognition", "finger detection",
-                    "gesture detection",
-                    "opencv", "cv2", "open cv",
-                    "mediapipe", "media pipe",
-                    "pillow", "pil", "imageai",
-                ],
-                "NLP": [
-                    "nlp", "natural language processing",
-                    "text classification", "sentiment analysis",
-                    "named entity recognition", "ner",
-                    "spacy", "nltk", "gensim",
-                    "hugging face", "huggingface",
-                    "langchain", "lang chain", "transformers",
-                ],
-                "Generative AI": [
-                    "generative ai", "genai", "gen ai",
-                    "large language model", "llm", "llms",
-                    "ai powered", "ai-powered",
-                    "llama", "llama 3", "llama3", "mixtral",
-                    "gpt", "gpt-4", "gpt-3", "chatgpt",
-                    "gemini", "groq api", "groq",
-                    "openai api", "openai", "anthropic",
-                    "stable diffusion",
-                ],
-                "OCR": [
-                    "ocr", "optical character recognition",
-                    "handwritten text recognition",
-                    "tesseract", "tesseract.js", "easyocr", "pytesseract",
-                ],
-                "Data Analysis": [
-                    "data analysis", "data analytics",
-                    "exploratory data analysis", "eda",
-                    "data visualization", "data wrangling",
-                    "pandas", "numpy",
-                    "matplotlib", "seaborn", "plotly",
-                    "jupyter", "jupyter notebook",
-                    "tableau", "power bi",
-                ],
-                "Big Data": [
-                    "big data", "apache spark", "pyspark",
-                    "hadoop", "kafka", "data pipeline", "etl",
-                ],
-            },
-
-            "Mobile Development": {
-                "Android": [
-                    "android", "android development",
-                    "android studio", "android sdk",
-                    "android app", "java android", "kotlin android",
-                ],
-                "React Native": ["react native"],
-                "Flutter":      ["flutter"],
-                "iOS": [
-                    "ios", "ios development",
-                    "xcode", "swift ui", "swiftui", "uikit",
-                ],
-            },
-
-            "IoT & Hardware": {
-                "IoT": [
-                    "iot", "internet of things",
-                    "smart appliance", "home automation",
-                    "embedded systems", "microcontroller",
-                    "esp32", "esp 32", "arduino", "arduino ide",
-                    "raspberry pi", "gpio", "serial communication",
-                    "pyserial", "uart", "i2c", "spi",
-                ],
-            },
-
-            "Tools & Platforms": {
-                "VS Code":   ["vs code", "vscode", "visual studio code"],
-                "Postman":   ["postman"],
-                "Figma":     ["figma"],
-                "Jira":      ["jira"],
-                "Linux":     ["linux", "ubuntu", "debian"],
-                "Bash":      ["bash", "shell scripting", "shell script"],
-            },
-
-            "DSA & CS Fundamentals": {
-                "DSA": [
-                    "data structures and algorithms", "dsa",
-                    "data structures", "algorithms", "mastering dsa",
-                    "leetcode", "geeksforgeeks",
-                    "competitive programming", "hackerrank dsa",
-                    "codechef", "codeforces",
-                ],
-                "OOP": [
-                    "object oriented programming", "oop",
-                    "object-oriented programming",
-                    "encapsulation", "inheritance", "polymorphism",
-                ],
-                "OS":           ["operating systems", "os concepts",
-                                 "process management", "memory management"],
-                "DBMS":         ["dbms", "database management systems",
-                                 "normalization", "er diagram"],
-                "Networking":   ["computer networks", "networking",
-                                 "tcp/ip", "http", "dns", "osi model"],
-                "System Design":["system design", "low level design",
-                                 "high level design", "lld", "hld"],
-            },
-
-            "Testing & QA": {
-                "Unit Testing": [
-                    "unit testing", "unit tests",
-                    "pytest", "jest", "junit", "mocha",
-                    "test driven development", "tdd",
-                ],
-                "Selenium":    ["selenium", "selenium webdriver"],
-                "API Testing": ["api testing", "postman testing"],
-            },
-
-            "Soft Skills & Methodologies": {
-                "Problem Solving": ["problem solving", "problem-solving",
-                                    "analytical thinking"],
-                "Leadership":      ["leadership", "team lead", "led a team",
-                                    "mentoring"],
-                "Communication":   ["communication", "presentation skills"],
-                "Agile":           ["agile", "scrum", "sprint", "kanban"],
-                "Time Management": ["time management"],
-                "Adaptability":    ["adaptability", "adaptable"],
-                "Teamwork":        ["teamwork", "collaboration"],
-            },
-        }
-
-    # ─────────────────────────────────────────────────────────────────── #
-    #  BUILD PATTERNS                                                      #
-    # ─────────────────────────────────────────────────────────────────── #
-
-    def _create_patterns(self):
-        for category, skills in self.skills_db.items():
-            for skill_name, aliases in skills.items():
-                self.skill_to_category[skill_name] = category
-                if skill_name not in self._all_skill_names:
-                    self._all_skill_names.append(skill_name)
-                patterns = [self.nlp.make_doc(alias) for alias in aliases]
-                self.matcher.add(skill_name, patterns)
-
-    # ─────────────────────────────────────────────────────────────────── #
-    #  PASS 1 — REGEX NORMALIZATION                                        #
-    # ─────────────────────────────────────────────────────────────────── #
-
-    def _normalize_text(self, text: str) -> str:
-        """
-        Normalize formatting so PhraseMatcher aliases match cleanly.
-        Also pre-splits the text into clean paragraphs using double newlines
-        so that spaCy sentence segmentation works correctly on resume text
-        (resumes often have no sentence-ending punctuation between sections).
-        """
-        # Curly apostrophes and quotes → straight
-        text = re.sub(r"[\u2018\u2019\u02BC]", "'", text)
-        text = re.sub(r"[\u201C\u201D]",        '"', text)
-
-        # Standalone C language — not followed by ++, #, SS(S), digits
-        text = re.sub(
-            r"(?<![A-Za-z0-9_#\+])\bC\b(?![+#A-Za-z0-9_])",
-            "c language", text
-        )
-
-        # Punctuation/casing variants → canonical alias forms
-        text = re.sub(r"\bReact\.js\b",      "React",        text, flags=re.IGNORECASE)
-        text = re.sub(r"\bVue\.js\b",        "Vue.js",       text, flags=re.IGNORECASE)
-        text = re.sub(r"\bNode\.JS\b",       "Node.js",      text, flags=re.IGNORECASE)
-        text = re.sub(r"\bExpress\.JS\b",    "Express.js",   text, flags=re.IGNORECASE)
-        text = re.sub(r"\bNext\.JS\b",       "Next.js",      text, flags=re.IGNORECASE)
-        text = re.sub(r"\bTesseract\.js\b",  "tesseract.js", text, flags=re.IGNORECASE)
-        text = re.sub(r"\bPySerial\b",       "pyserial",     text, flags=re.IGNORECASE)
-        text = re.sub(r"\bOpenCV\b",         "opencv",       text, flags=re.IGNORECASE)
-        text = re.sub(r"\bMediaPipe\b",      "mediapipe",    text, flags=re.IGNORECASE)
-        text = re.sub(r"\bLLaMA\b",          "llama",        text, flags=re.IGNORECASE)
-        text = re.sub(r"\bMixtral\b",        "mixtral",      text, flags=re.IGNORECASE)
-
-        # Normalize Amazon's → amazons (apostrophe removed so alias matches)
-        text = re.sub(r"\bAmazon's\b", "amazons", text, flags=re.IGNORECASE)
-
-        # Collapse excessive whitespace (but preserve newlines for paragraph splitting)
-        text = re.sub(r"[ \t]{2,}", " ", text)
-
-        return text
-
-    # ─────────────────────────────────────────────────────────────────── #
-    #  SLIDING WINDOW N-GRAMS                                              #
-    # ─────────────────────────────────────────────────────────────────── #
-
-    def _sliding_window_ngrams(self, text: str) -> list[str]:
-        """
-        Generate overlapping n-grams (4 to 8 words) from each line/sentence.
-        This is the KEY fix for descriptive resumes.
-
-        Problem it solves:
-          spaCy sentence segmentation fails on resume text because sections
-          are often separated by newlines, not punctuation. This causes long
-          "sentences" that get threshold 0.88 — too strict to match.
-
-          Sliding window n-grams break the text into small focused windows
-          that directly capture phrases like:
-            "packaging and shipping applications along with their dependencies"
-            "amazon cloud platform for hosting"
-
-        These go through threshold 0.82 — between noun chunks and sentences.
-        """
-        ngrams = []
-        # Split on newlines and periods to get clean segments
-        segments = re.split(r'[\n\r\.]+', text)
-
-        for segment in segments:
-            words = segment.strip().split()
-            for size in range(self.NGRAM_MIN, self.NGRAM_MAX + 1):
-                for i in range(len(words) - size + 1):
-                    gram = " ".join(words[i:i + size])
-                    ngrams.append(gram)
-
-        return ngrams
-
-    # ─────────────────────────────────────────────────────────────────── #
-    #  PASS 3 — SEMANTIC MATCHING                                          #
-    # ─────────────────────────────────────────────────────────────────── #
-
-    def _semantic_match(self, text: str, already_found: set[str]) -> list[str]:
-        """
-        Builds candidates from THREE sources:
-          1. spaCy noun chunks (2+ words)         → threshold 0.78
-          2. spaCy sentences per paragraph        → threshold 0.88
-          3. Sliding window n-grams (4–8 words)   → threshold 0.82  ← KEY FIX
-
-        The n-gram window is what catches descriptive phrases like:
-          "packaging and shipping applications along with their dependencies"
-            → Docker
-          "amazon cloud platform for hosting and managing web applications"
-            → AWS
-        """
-        if not _ST_AVAILABLE or self._st_model is None:
-            return []
-
-        doc = self.nlp(text)
-        candidates: list[tuple[str, float]] = []
-        seen_candidates: set[str] = set()
-
-        def add(phrase: str, threshold: float):
-            phrase = phrase.strip()
-            if phrase and phrase not in seen_candidates:
-                seen_candidates.add(phrase)
-                candidates.append((phrase, threshold))
-
-        # Source 1 — noun chunks (2+ words)
-        for chunk in doc.noun_chunks:
-            if len(chunk.text.split()) >= 2:
-                add(chunk.text, self.NOUN_CHUNK_THRESHOLD)
-
-        # Source 2 — sentences (split by paragraph first for cleaner segmentation)
-        for paragraph in re.split(r'\n{1,}', text):
-            paragraph = paragraph.strip()
-            if not paragraph:
-                continue
-            para_doc = self.nlp(paragraph)
-            for sent in para_doc.sents:
-                if len(sent.text.strip()) > 15:
-                    add(sent.text.strip(), self.SENTENCE_THRESHOLD)
-
-        # Source 3 — sliding window n-grams (4–8 words)
-        for gram in self._sliding_window_ngrams(text):
-            add(gram, self.NGRAM_THRESHOLD)
-
-        if not candidates:
-            return []
-
-        texts      = [c[0] for c in candidates]
-        thresholds = [c[1] for c in candidates]
-
-        cand_emb      = self._st_model.encode(texts, convert_to_tensor=True)
-        cosine_scores = util.cos_sim(cand_emb, self._skill_embeddings)
-
-        found = []
-        for idx, skill_name in enumerate(self._all_skill_names):
-            if skill_name in already_found:
-                continue
-            skill_col = cosine_scores[:, idx]
-            if any(float(skill_col[i]) >= thresholds[i] for i in range(len(candidates))):
-                found.append(skill_name)
-
-        return found
+        self.client = Groq(api_key=api_key)
+        self.model  = "llama-3.3-70b-versatile"
 
     # ─────────────────────────────────────────────────────────────────── #
     #  PUBLIC: extract_all_skills                                          #
     # ─────────────────────────────────────────────────────────────────── #
 
-    def extract_all_skills(self, text: str) -> dict:
+    def extract_all_skills(self, resume_text: str) -> dict:
         """
+        Extracts skills AND projects from resume using LLaMA.
+
         Returns:
+        {
+          "categories": {
+            category: [{"name": skill, "source": "llm"}]
+          },
+          "total_skills": int,
+          "projects": [
             {
-                "categories": {
-                    category_name: [
-                        {"name": "Python",  "source": "explicit"},
-                        {"name": "Docker",  "source": "semantic"},
-                        {"name": "AWS",     "source": "semantic"},
-                    ]
-                },
-                "total_skills": int
+              "title":        str,
+              "description":  str,
+              "technologies": [str],
+              "highlights":   [str],
+              "skill_context": {
+                skill_name: "how this skill was used in this project"
+              }
             }
-        """
-        # Pass 1 — normalize
-        normalized = self._normalize_text(text)
-
-        doc     = self.nlp(normalized)
-        matches = self.matcher(doc)
-
-        categorized: dict[str, list[dict]] = defaultdict(list)
-        seen:        set[str]              = set()
-
-        # Pass 2 — PhraseMatcher
-        for match_id, _start, _end in matches:
-            skill_name = self.nlp.vocab.strings[match_id]
-            if skill_name not in seen:
-                seen.add(skill_name)
-                category = self.skill_to_category.get(skill_name, "Other")
-                categorized[category].append({
-                    "name":   skill_name,
-                    "source": "explicit",
-                })
-
-        # Pass 3 — semantic (noun chunks + sentences + n-gram sliding window)
-        for skill_name in self._semantic_match(normalized, seen):
-            if skill_name not in seen:
-                seen.add(skill_name)
-                category = self.skill_to_category.get(skill_name, "Other")
-                categorized[category].append({
-                    "name":   skill_name,
-                    "source": "semantic",
-                })
-
-        # Preserve category order
-        formatted: dict[str, list] = {
-            cat: categorized.get(cat, [])
-            for cat in self.skills_db
+          ]
         }
+        """
+        try:
+            raw = self._call_llama(resume_text)
+            return self._parse_response(raw)
+        except Exception as e:
+            print(f"[SkillExtractor] LLaMA failed: {e}. Using fallback.")
+            result = self._keyword_fallback(resume_text)
+            result["projects"] = []
+            return result
+
+    # ─────────────────────────────────────────────────────────────────── #
+    #  PRIVATE: LLaMA API call                                             #
+    # ─────────────────────────────────────────────────────────────────── #
+
+    def _call_llama(self, resume_text: str) -> str:
+        cat_block = "\n".join(
+            f"  {i+1:02d}. {cat}\n      {desc}"
+            for i, (cat, desc) in enumerate(CATEGORY_DEFINITIONS.items())
+        )
+
+        prompt = f"""You are an expert technical recruiter. Read the resume below carefully.
+Extract TWO things:
+
+════════════════════════════════════════════════════
+PART 1 — SKILLS
+════════════════════════════════════════════════════
+Map every skill to one of these categories:
+{cat_block}
+
+RULES:
+1. Read the FULL resume — skills section, projects, experience, certifications.
+2. Infer skills from context:
+   - "built REST APIs using Flask and deployed on EC2" → Flask, REST API, AWS
+   - "trained a CNN model using PyTorch" → Deep Learning, Computer Vision
+3. Use canonical names: opencv/cv2/mediapipe → "Computer Vision",
+   tensorflow/pytorch → "Deep Learning", scikit-learn → "Machine Learning"
+4. Do NOT list tools as separate skills — map to parent skill.
+5. Each skill appears ONCE across all categories.
+6. Include ALL 12 categories (empty list [] if none found).
+
+════════════════════════════════════════════════════
+PART 2 — PROJECTS
+════════════════════════════════════════════════════
+Extract all projects from the resume.
+For each project, also extract skill_context — how each technical skill
+was specifically used in that project. This is used to generate
+project-specific interview questions.
+
+════════════════════════════════════════════════════
+RESUME:
+════════════════════════════════════════════════════
+{resume_text[:6000]}
+
+════════════════════════════════════════════════════
+OUTPUT — valid JSON only, no markdown:
+════════════════════════════════════════════════════
+{{
+  "skills": {{
+    "Programming Languages":       ["Python", "Java"],
+    "Frontend Development":        ["React", "HTML", "CSS"],
+    "Backend Development":         ["Flask", "REST API"],
+    "Databases":                   ["MySQL", "MongoDB"],
+    "Cloud & DevOps":              ["AWS", "Docker", "Git"],
+    "Data Science & AI":           ["Machine Learning", "Computer Vision"],
+    "Mobile Development":          [],
+    "IoT & Hardware":              [],
+    "Tools & Platforms":           ["VS Code", "Linux"],
+    "DSA & CS Fundamentals":       ["DSA", "OOP"],
+    "Testing & QA":                [],
+    "Soft Skills & Methodologies": ["Problem Solving", "Agile"]
+  }},
+  "projects": [
+    {{
+      "title":        "Face Recognition Attendance System",
+      "description":  "Automated attendance system using face recognition",
+      "technologies": ["Python", "OpenCV", "Deep Learning", "MySQL"],
+      "highlights":   ["95% accuracy", "Real-time detection"],
+      "skill_context": {{
+        "Computer Vision": "Used OpenCV and MediaPipe for real-time face detection and landmark extraction",
+        "Deep Learning":   "Trained CNN model using PyTorch for face recognition with 95% accuracy",
+        "MySQL":           "Stored attendance records and student profiles in MySQL database"
+      }}
+    }}
+  ]
+}}
+"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role":    "system",
+                    "content": (
+                        "You are an expert technical recruiter. "
+                        "Extract skills and projects from resumes. "
+                        "Return valid JSON only — no markdown, no extra text."
+                    )
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.1,
+            max_tokens=2000,
+        )
+        return response.choices[0].message.content.strip()
+
+    # ─────────────────────────────────────────────────────────────────── #
+    #  PRIVATE: parse response                                             #
+    # ─────────────────────────────────────────────────────────────────── #
+
+    def _parse_response(self, raw: str) -> dict:
+        raw = re.sub(r"^```(?:json)?", "", raw.strip()).strip()
+        raw = re.sub(r"```$", "", raw).strip()
+
+        m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if not m:
+            raise ValueError(f"No JSON found in response: {raw[:200]}")
+
+        parsed = json.loads(m.group())
+
+        # ── Parse skills ─────────────────────────────────────────────
+        categories: dict[str, list[dict]] = {}
+        raw_skills = parsed.get("skills", {})
+
+        for category in CATEGORY_DEFINITIONS:
+            skill_list = raw_skills.get(category, [])
+            if not isinstance(skill_list, list):
+                skill_list = []
+
+            entries = []
+            seen    = set()
+            for skill in skill_list:
+                if not isinstance(skill, str) or not skill.strip():
+                    continue
+                canonical = CANONICAL_NAMES.get(skill.strip().lower(), skill.strip())
+                if canonical == canonical.lower():
+                    canonical = canonical.title()
+                if canonical not in seen:
+                    seen.add(canonical)
+                    entries.append({"name": canonical, "source": "llm"})
+            categories[category] = entries
+
+        # ── Parse projects ────────────────────────────────────────────
+        raw_projects = parsed.get("projects", [])
+        projects     = []
+
+        if isinstance(raw_projects, list):
+            for p in raw_projects:
+                if not isinstance(p, dict):
+                    continue
+                projects.append({
+                    "title":        p.get("title", "Unnamed Project"),
+                    "description":  p.get("description", ""),
+                    "technologies": p.get("technologies", []),
+                    "highlights":   p.get("highlights", []),
+                    "skill_context": p.get("skill_context", {}),
+                })
+
+        total = sum(len(v) for v in categories.values())
+        print(f"[SkillExtractor] Extracted {total} skills, {len(projects)} projects.")
 
         return {
-            "categories":   formatted,
-            "total_skills": sum(len(v) for v in formatted.values()),
+            "categories":   categories,
+            "total_skills": total,
+            "projects":     projects,
         }
+
+    # ─────────────────────────────────────────────────────────────────── #
+    #  PRIVATE: keyword fallback                                           #
+    # ─────────────────────────────────────────────────────────────────── #
+
+    def _keyword_fallback(self, text: str) -> dict:
+        text_lower = text.lower()
+        result: dict[str, list[dict]] = {}
+
+        for category in CATEGORY_DEFINITIONS:
+            keywords = FALLBACK_KEYWORDS.get(category, [])
+            found, seen = [], set()
+            for kw in keywords:
+                if kw in text_lower:
+                    canonical = CANONICAL_NAMES.get(kw, kw.title())
+                    if canonical not in seen:
+                        seen.add(canonical)
+                        found.append({"name": canonical, "source": "fallback"})
+            result[category] = found
+
+        total = sum(len(v) for v in result.values())
+        print(f"[SkillExtractor] Fallback: {total} skills.")
+        return {"categories": result, "total_skills": total}

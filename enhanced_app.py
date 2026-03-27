@@ -12,7 +12,8 @@ import streamlit as st
 from enhanced_skill_extractor import EnhancedSkillExtractor
 from resume_parser import ResumeParser
 from question_generator import QuestionGenerator
-from answer_evaluator import AnswerEvaluator
+from answer_evaluator import AnswerEvaluator, LIKERT_SCALE
+import rasch_engine as irt
 
 st.set_page_config(
     page_title="AI Interview Coach",
@@ -160,6 +161,23 @@ section[data-testid="stSidebar"] .stButton button {
     background:#f8fafc; border-radius:10px; padding:10px 14px;
     border:1px solid #e2e8f0;
 }
+
+.likert-container { margin: 1rem 0 0.5rem; }
+.likert-label { font-size: 0.82rem; font-weight: 600; color: #374151; margin-bottom: 0.5rem; }
+.likert-hint  { font-size: 0.78rem; color: #6b7280; margin-top: 0.25rem; }
+.calibration-box {
+    border-radius: 10px; padding: 10px 16px; margin-top: 0.8rem;
+    font-size: 0.85rem; display: flex; align-items: flex-start; gap: 10px;
+}
+.calibration-accurate   { background: #f0fdf4; border: 1.5px solid #86efac; color: #15803d; }
+.calibration-over       { background: #fff7ed; border: 1.5px solid #fdba74; color: #c2410c; }
+.calibration-under      { background: #eff6ff; border: 1.5px solid #93c5fd; color: #1d4ed8; }
+.calibration-close      { background: #f0fdf4; border: 1.5px solid #86efac; color: #15803d; }
+.calibration-default    { background: #f8fafc; border: 1.5px solid #e2e8f0; color: #475569; }
+.score-split { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
+.score-base  { font-size: 0.75rem; color: #6b7280; }
+.score-self  { font-size: 0.75rem; color: #7c3aed; font-weight: 600; }
+
 </style>
 """, unsafe_allow_html=True)
 
@@ -273,12 +291,15 @@ def progress_bar(current, total):
 defaults = {
     "stage":              "upload",
     "skills_data":        None,
+        "answers_per_skill":  9,
     "questions":          [],
     "answers":            {},
     "evaluations":        {},
     "q_index":            0,
     "resume_text":        "",
     "last_uploaded_file": None,
+    "current_q_irt":      None,
+    "current_cat_irt":    None,
 }
 for k, v in defaults.items():
     if k not in st.session_state:
@@ -415,7 +436,7 @@ elif st.session_state.stage == "configure":
     st.markdown("""
     <div class="page-banner">
         <h1>Skills Detected</h1>
-        <p>Review what we found in your resume (phrase-match + semantic), then configure your session</p>
+        <p>Review what LLaMA extracted from your resume, then configure your session</p>
     </div>""", unsafe_allow_html=True)
 
     skills_data  = st.session_state.skills_data
@@ -426,8 +447,8 @@ elif st.session_state.stage == "configure":
 
     st.markdown("""
     <div class="legend-box">
-        <span><span class="skill-pill">Skill</span> &nbsp;directly mentioned in resume</span>
-        <span><span class="skill-pill-semantic">Skill</span> &nbsp;inferred via semantic similarity</span>
+        <span><span class="skill-pill">Skill</span> &nbsp;extracted by LLaMA from resume</span>
+        <span><span class="skill-pill-semantic">Skill</span> &nbsp;keyword fallback (API unavailable)</span>
     </div>""", unsafe_allow_html=True)
 
     st.markdown(f"<p style='font-size:0.9rem;color:#475569;margin-bottom:1rem'>"
@@ -438,7 +459,7 @@ elif st.session_state.stage == "configure":
         if skills_list:
             pills = ""
             for s in skills_list:
-                css_class = "skill-pill-semantic" if s.get("source") == "semantic" else "skill-pill"
+                css_class = "skill-pill-semantic" if s.get("source") == "fallback" else "skill-pill"
                 pills += f'<span class="{css_class}">{s["name"]}</span> '
             st.markdown(
                 f'<div style="margin-bottom:0.9rem">'
@@ -449,26 +470,28 @@ elif st.session_state.stage == "configure":
 
     st.markdown('<div class="content-card">', unsafe_allow_html=True)
     st.markdown('<div class="section-label">Interview Settings</div>', unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        difficulty = st.selectbox("Difficulty Level", ["easy","medium","hard"],
-                                  index=1, format_func=str.capitalize)
-    with col2:
-        q_per_skill = st.slider("Questions per Skill", 1, 3, 2)
+    # Pool is fixed at 5 per difficulty level = 15 per skill
+    q_per_level = 5
+
+    answers_per_skill = st.slider(
+        "Questions per skill", min_value=5, max_value=15, value=9, step=1,
+        help="IRT adaptively picks from a pool of 15 questions (5 easy + 5 medium + 5 hard) per skill."
+    )
 
     include_projects = st.checkbox(
         "🗂️  Include project-based questions (extracted from resume)",
         value=True
     )
 
-    estimated = total_skills * q_per_skill
+    pool_size = total_skills * 15  # fixed: 5×3 per skill
+    estimated = total_skills * answers_per_skill
     proj_note = " + project questions" if include_projects else ""
     st.markdown(f"""
     <div style="background:#eef2ff;border:1.5px solid #c7d2fe;border-radius:10px;
                 padding:12px 18px;margin:1rem 0;display:flex;align-items:center;gap:10px">
         <span style="font-size:1.2rem">📋</span>
         <span style="font-size:0.9rem;color:#3730a3">
-            <b>~{estimated} questions</b>{proj_note} will be generated for this session
+            <b>Pool: {pool_size} questions generated</b> (5 easy + 5 medium + 5 hard per skill) · <b>Student answers: {estimated}</b> (IRT adaptive){proj_note}
         </span>
     </div>""", unsafe_allow_html=True)
 
@@ -485,21 +508,50 @@ elif st.session_state.stage == "configure":
                     resume_text_for_projects = (
                         st.session_state.resume_text if include_projects else ""
                     )
-                    questions = question_gen.generate_questions(
-                        skills_data,
-                        difficulty=difficulty,
-                        questions_per_skill=q_per_skill,
-                        resume_text=resume_text_for_projects,
-                    )
-                if questions:
-                    st.session_state.questions   = questions
-                    st.session_state.q_index     = 0
-                    st.session_state.answers     = {}
-                    st.session_state.evaluations = {}
-                    st.session_state.stage       = "interview"
+                    questions      = []
+                    gen_error      = None
+                    try:
+                        questions = question_gen.generate_questions(
+                            skills_data,
+                            questions_per_skill=q_per_level,
+                            resume_text=resume_text_for_projects,
+                        )
+                    except RuntimeError as e:
+                        gen_error = str(e)
+                    except Exception as e:
+                        gen_error = f"Unexpected error: {e}"
+
+                if gen_error:
+                    st.error(f"❌ Question generation failed:\n\n{gen_error}")
+                    st.info("💡 Fix: Go to console.groq.com → API Keys → create a new key → update your .env or .secrets.toml file.")
+                elif questions:
+                    # Build IRT pool per category
+                    # {category: [question dicts with b_param]}
+                    cat_pool = {}
+                    for q in questions:
+                        cat = q.get("category", "Other")
+                        cat_pool.setdefault(cat, []).append(q)
+
+                    st.session_state.questions        = questions
+                    st.session_state.q_index          = 0
+                    st.session_state.answers          = {}
+                    st.session_state.evaluations      = {}
+                    st.session_state.cat_pool         = cat_pool
+                    st.session_state.category_thetas  = {
+                        cat: irt.THETA_INIT for cat in cat_pool
+                    }
+                    st.session_state.category_asked   = {
+                        cat: set() for cat in cat_pool
+                    }
+                    st.session_state.category_responses = {
+                        cat: [] for cat in cat_pool
+                    }
+                    st.session_state.answers_per_skill = answers_per_skill
+                    st.session_state.stage            = "interview"
                     st.rerun()
                 else:
-                    st.error("Failed to generate questions. Check your Groq API key.")
+                    st.error("❌ No questions were generated. This usually means the model returned empty output.")
+                    st.info("💡 Try reducing 'Questions per Skill' to 1, or check your internet connection.")
     st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -508,14 +560,71 @@ elif st.session_state.stage == "configure":
 # ================================================================== #
 
 elif st.session_state.stage == "interview":
-    questions = st.session_state.questions
-    q_index   = st.session_state.q_index
-    total     = len(questions)
+    questions         = st.session_state.questions
+    q_index           = st.session_state.q_index
+    answers_per_skill = st.session_state.get("answers_per_skill", 9)
+    cat_pool          = st.session_state.get("cat_pool", {})
+    cat_thetas        = st.session_state.get("category_thetas", {})
+    cat_asked         = st.session_state.get("category_asked", {})
+
+    # Total questions student should answer
+    total = len(cat_pool) * answers_per_skill
 
     if not questions:
         st.warning("No questions available."); st.stop()
 
-    q = questions[q_index]
+    # ── IRT Question Selection ────────────────────────────────────────
+    # Pick next question from pool where b ≈ current θ for that category
+    # Cycles through categories to ensure all skills are covered
+    answered_count = len(st.session_state.evaluations)
+
+    # Determine which category to pick from next (round-robin across categories)
+    cats_list    = list(cat_pool.keys())
+    n_cats       = len(cats_list)
+    current_cat  = cats_list[answered_count % n_cats] if n_cats > 0 else None
+
+    # Count answered questions per category using q_uid keys
+    cat_answer_counts = {}
+    q_uid_to_cat = {
+        q.get("question_id", str(i)): q.get("category", "Other")
+        for i, q in enumerate(questions)
+    }
+    for q_uid_key in st.session_state.evaluations:
+        cat_of_q = q_uid_to_cat.get(q_uid_key, "Other")
+        cat_answer_counts[cat_of_q] = cat_answer_counts.get(cat_of_q, 0) + 1
+
+    # Find a category that still needs answers
+    # Use stored current question if available (persists across reruns within same question)
+    stored_q   = st.session_state.get("current_q_irt")
+    stored_cat = st.session_state.get("current_cat_irt")
+
+    # Check if stored question is still valid (not yet answered)
+    if stored_q and stored_q.get("question_id") not in st.session_state.evaluations:
+        q           = stored_q
+        current_cat = stored_cat
+    else:
+        # Pick new question
+        q = None
+        for offset in range(n_cats):
+            try_cat = cats_list[(answered_count + offset) % n_cats]
+            if cat_answer_counts.get(try_cat, 0) >= answers_per_skill:
+                continue
+            pool      = cat_pool.get(try_cat, [])
+            theta     = cat_thetas.get(try_cat, 0.0)
+            asked_ids = cat_asked.get(try_cat, set())
+            selected  = irt.select_question(pool, theta, asked_ids, None)
+            if selected:
+                q           = selected
+                current_cat = try_cat
+                # Store so it persists on rerun
+                st.session_state.current_q_irt   = q
+                st.session_state.current_cat_irt = current_cat
+                break
+
+    # All categories answered enough questions → go to results
+    if q is None:
+        st.session_state.stage = "results"
+        st.rerun()
 
     st.markdown("""
     <div class="page-banner">
@@ -524,7 +633,7 @@ elif st.session_state.stage == "interview":
     </div>""", unsafe_allow_html=True)
 
     st.markdown('<div class="content-card">', unsafe_allow_html=True)
-    progress_bar(q_index, total)
+    progress_bar(answered_count, total)
 
     dc, dc_bg, dc_border = diff_badge(q.get("difficulty","medium"))
     type_icon = {
@@ -540,7 +649,7 @@ elif st.session_state.stage == "interview":
     st.markdown(f"""
     <div class="q-card" style="background:{card_bg};border-color:{card_border}">
         <div class="q-meta">
-            <span class="q-num">Q{q_index+1}</span>
+            <span class="q-num">Q{answered_count+1}</span>
             <span class="q-skill">{q.get('skill','')}</span>
             <span style="background:{dc_bg};color:{dc};border:1px solid {dc_border};
                          padding:3px 10px;border-radius:999px;font-weight:600">
@@ -558,7 +667,7 @@ elif st.session_state.stage == "interview":
     render_confidence_badge(q)
 
     if q.get("hints"):
-        if st.checkbox("💡 Show a hint", key=f"hint_{q_index}"):
+        if st.checkbox("💡 Show a hint", key=f"hint_{q.get('question_id', q_index)}"):
             hints_html = "".join(f"<li style='margin-bottom:4px'>{h}</li>" for h in q["hints"])
             st.markdown(
                 f'<div class="hint-box"><b>Hints:</b>'
@@ -566,84 +675,192 @@ elif st.session_state.stage == "interview":
                 unsafe_allow_html=True)
 
     st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    prev_answer = st.session_state.answers.get(q_index, "")
+    q_uid = q.get("question_id", str(q_index))
+    prev_answer = st.session_state.answers.get(q_uid, "")
     answer = st.text_area("Your Answer", value=prev_answer, height=180,
                           placeholder="Write your answer here — be as detailed as possible…",
-                          key=f"ans_{q_index}")
+                          key=f"ans_{q_uid}")
+
+
 
     col_prev, col_submit, col_next = st.columns([1, 2, 1])
     with col_prev:
-        if q_index > 0:
+        if answered_count > 0:
             if st.button("← Previous", use_container_width=True):
                 st.session_state.q_index -= 1; st.rerun()
     with col_submit:
-        already_done = q_index in st.session_state.evaluations
+        already_done = q_uid in st.session_state.evaluations
         lbl = "Re-evaluate ↺" if already_done else "Submit & Evaluate →"
         if st.button(lbl, type="primary", use_container_width=True):
             if not answer.strip():
                 st.warning("Please write an answer first.")
             else:
-                st.session_state.answers[q_index] = answer
+                st.session_state.answers[q_uid] = answer
                 with st.spinner("AI is evaluating your answer…"):
                     result = answer_eval.evaluate_answer(
                         question=q["question"], user_answer=answer,
                         model_answer=q.get("model_answer",""),
-                        skill=q.get("skill",""), difficulty=q.get("difficulty","medium"))
-                st.session_state.evaluations[q_index] = result
-                st.rerun()
+                        skill=q.get("skill",""))
+                st.session_state.evaluations[q_uid] = result
+
+                # ── IRT θ update ──────────────────────────────────────
+                cat        = current_cat or q.get("category", "Other")
+                b_param    = float(q.get("b_param", 0.0))
+                score      = result.get("total_score", 0)
+                frac_correct = score / 100.0   # fractional correct (0.0-1.0)
+
+                if cat in st.session_state.get("category_thetas", {}):
+                    theta_before = st.session_state.category_thetas[cat]
+                    p_pred       = irt.p_correct(theta_before, b_param)
+                    surprise     = frac_correct - p_pred
+                    theta_after  = float(
+                        max(irt.THETA_MIN,
+                            min(irt.THETA_MAX,
+                                theta_before + irt.ALPHA * surprise))
+                    )
+                    st.session_state.category_thetas[cat] = theta_after
+
+                    # Track response for SE calculation
+                    st.session_state.category_responses[cat].append({
+                        "theta_before": theta_before,
+                        "b_used":       b_param,
+                        "frac_correct": frac_correct,
+                        "surprise":     surprise,
+                        "theta_after":  theta_after,
+                    })
+                    # Mark question as asked in IRT pool
+                    st.session_state.category_asked[cat].add(q_uid)
+
+                    result["irt"] = {
+                        "theta_before":  round(theta_before, 3),
+                        "theta_after":   round(theta_after, 3),
+                        "b_param":       b_param,
+                        "p_correct_irt": round(p_pred, 3),
+                        "surprise":      round(surprise, 3),
+                        "proficiency":   irt.theta_to_proficiency(theta_after),
+                        "se":            irt.se_theta(
+                                            st.session_state.category_responses[cat]
+                                         ),
+                    }
+                    st.session_state.evaluations[q_uid] = result
+
+                # Do NOT rerun — stay on this page to show feedback
+                # User clicks "Next Question →" to move forward
     with col_next:
-        if q_index < total - 1:
-            if st.button("Next →", use_container_width=True):
-                if q_index not in st.session_state.evaluations and answer.strip():
-                    st.session_state.answers[q_index] = answer
-                st.session_state.q_index += 1; st.rerun()
+        if st.button("Next Question →", use_container_width=True,
+                     type="primary" if q_uid in st.session_state.evaluations else "secondary"):
+            # Clear stored question so IRT picks a new one
+            st.session_state.current_q_irt   = None
+            st.session_state.current_cat_irt = None
+            st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
-    if q_index in st.session_state.evaluations:
-        ev = st.session_state.evaluations[q_index]
+    if q_uid in st.session_state.evaluations:
+        ev      = st.session_state.evaluations[q_uid]
+        likert  = ev.get("likert", 0)
+        emoji   = ev.get("likert_emoji", "")
+        label   = ev.get("likert_label", "")
+        color   = ev.get("likert_color", "#64748b")
+        score   = ev.get("total_score", 0)
+
         st.markdown('<div class="content-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Your Feedback</div>', unsafe_allow_html=True)
 
-        col_sc, col_bd = st.columns([1, 2])
-        with col_sc:
-            render_score(ev["total_score"], ev["grade"])
-        with col_bd:
-            render_breakdown(ev.get("breakdown", {}))
+        # ── Likert rating display ─────────────────────────────────── #
+        st.markdown(f'''
+        <div style="display:flex;align-items:center;gap:20px;
+                    background:#f8fafc;border-radius:12px;padding:1rem 1.4rem;
+                    border:2px solid {color};margin-bottom:1rem">
+            <div style="font-size:2.5rem">{emoji}</div>
+            <div>
+                <div style="font-size:0.75rem;color:#64748b;font-weight:600;
+                            letter-spacing:0.08em;text-transform:uppercase">
+                    AI Rating
+                </div>
+                <div style="font-size:1.4rem;font-weight:800;color:{color}">
+                    {likert}/5 — {label}
+                </div>
+                <div style="font-size:0.82rem;color:#64748b;margin-top:2px">
+                    Score: {score}/100
+                </div>
+            </div>
+            <div style="margin-left:auto;display:flex;gap:6px">
+                {" ".join([
+                    f'<span style="font-size:1.4rem;opacity:{1.0 if i <= likert else 0.2}">⭐</span>'
+                    for i in range(1, 6)
+                ])}
+            </div>
+        </div>''', unsafe_allow_html=True)
 
+        # ── Strengths and Improvements ───────────────────────────── #
         st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
         col_s, col_i = st.columns(2)
         with col_s:
             st.markdown('<div class="section-label">💪 Strengths</div>', unsafe_allow_html=True)
             for s in ev.get("strengths", []):
-                st.markdown(f'<div class="fb-strength"><span>✓</span> {s}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="fb-strength"><span>✓</span> {s}</div>',
+                            unsafe_allow_html=True)
         with col_i:
             st.markdown('<div class="section-label">📈 To Improve</div>', unsafe_allow_html=True)
             for imp in ev.get("improvements", []):
-                st.markdown(f'<div class="fb-improve"><span>→</span> {imp}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="fb-improve"><span>→</span> {imp}</div>',
+                            unsafe_allow_html=True)
 
+        # ── Detailed feedback ────────────────────────────────────── #
         with st.expander("📝 Read detailed feedback"):
             st.write(ev.get("detailed_feedback", ""))
             if ev.get("correct_answer_summary"):
                 st.markdown(f"""
-                <div style="background:#eef2ff;border:1.5px solid #c7d2fe;border-radius:10px;
-                            padding:12px 16px;margin-top:10px">
+                <div style="background:#eef2ff;border:1.5px solid #c7d2fe;
+                            border-radius:10px;padding:12px 16px;margin-top:10px">
                     <b style="color:#4338ca">Ideal Answer:</b>
                     <span style="color:#1e1b4b"> {ev['correct_answer_summary']}</span>
                 </div>""", unsafe_allow_html=True)
+
+        # ── IRT ability update display ───────────────────────── #
+        irt_data = ev.get("irt")
+        if irt_data:
+            tb    = irt_data["theta_before"]
+            ta    = irt_data["theta_after"]
+            dth   = ta - tb
+            prof  = irt_data["proficiency"]
+            se    = irt_data["se"]
+            arrow = "↑" if dth >= 0 else "↓"
+            color = prof["color"]
+            st.markdown(f"""
+            <div style="background:#f8fafc;border-radius:10px;
+                        padding:0.8rem 1.2rem;border-left:3px solid {color};
+                        margin-top:0.5rem;font-size:0.85rem">
+                <b style="color:{color}">🧠 Ability Update (IRT)</b><br>
+                θ: <code>{tb:+.3f}</code> → <code>{ta:+.3f}</code>
+                <span style="color:{color};font-weight:700">
+                    {arrow} {abs(dth):.3f}
+                </span>
+                &nbsp;·&nbsp;
+                <span style="background:{color};color:white;
+                             border-radius:4px;padding:1px 8px;font-size:0.78rem">
+                    {prof['label']}
+                </span>
+                &nbsp;·&nbsp;
+                SE(θ) = {se:.3f}
+                &nbsp;·&nbsp; b = {irt_data['b_param']:+.2f}
+                &nbsp;·&nbsp; P(correct) = {irt_data['p_correct_irt']:.1%}
+            </div>""", unsafe_allow_html=True)
+
         st.markdown('</div>', unsafe_allow_html=True)
 
-    answered = len(st.session_state.evaluations)
-    if answered > 0:
+    n_answered = len(st.session_state.evaluations)
+    if n_answered > 0:
         st.markdown('<div class="content-card">', unsafe_allow_html=True)
         st.markdown(f"""
         <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px">
             <div>
                 <div style="font-weight:700;color:#1e1b4b">Ready to see your results?</div>
-                <div style="font-size:0.82rem;color:#6b7280">{answered} of {total} questions answered</div>
+                <div style="font-size:0.82rem;color:#6b7280">{n_answered} of {total} questions answered</div>
             </div>
         </div>""", unsafe_allow_html=True)
-        if st.button(f"View Full Results ({answered}/{total}) →", type="primary", use_container_width=True):
+        if st.button(f"View Full Results ({n_answered}/{total}) →", type="primary", use_container_width=True):
             st.session_state.stage = "results"; st.rerun()
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -659,9 +876,11 @@ elif st.session_state.stage == "results":
     if not evaluations:
         st.info("No answers evaluated yet."); st.stop()
 
-    answered_qs = sorted(evaluations.keys())
-    ev_list     = [evaluations[i] for i in answered_qs]
-    q_list      = [questions[i]   for i in answered_qs]
+    # evaluations keyed by question_id (q_uid)
+    ev_list = list(evaluations.values())
+    # match questions to evaluations by question_id
+    q_uid_to_q = {q.get("question_id", str(i)): q for i, q in enumerate(questions)}
+    q_list = [q_uid_to_q.get(uid, {}) for uid in evaluations.keys()]
     summary     = answer_eval.compute_session_summary(ev_list, q_list)
 
     avg   = summary["average_score"]
@@ -702,6 +921,65 @@ elif st.session_state.stage == "results":
 
     st.write("")
 
+    # ── IRT Proficiency Section ──────────────────────────────────── #
+    cat_thetas = st.session_state.get("category_thetas", {})
+    cat_responses = st.session_state.get("category_responses", {})
+    if cat_thetas:
+        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">🧠 Skill Proficiency (IRT)</div>',
+                    unsafe_allow_html=True)
+
+        overall_theta = irt.compute_overall_theta(cat_thetas)
+        overall_prof  = irt.theta_to_proficiency(overall_theta)
+        oc, obg       = overall_prof["color"], "#f8fafc"
+
+        st.markdown(f"""
+        <div style="background:#f0f4ff;border-radius:10px;
+                    padding:0.8rem 1.2rem;margin-bottom:1rem;
+                    border-left:4px solid {oc}">
+            <b>Overall θ = {overall_theta:+.3f}</b>
+            &nbsp;→&nbsp;
+            <span style="background:{oc};color:white;border-radius:4px;
+                         padding:2px 10px;font-size:0.82rem;font-weight:700">
+                {overall_prof['label']}
+            </span>
+            &nbsp;·&nbsp;
+            <span style="font-size:0.82rem;color:#64748b">
+                {overall_prof['score']:.1f}% proficiency
+            </span>
+        </div>""", unsafe_allow_html=True)
+
+        prof_cols = st.columns(min(len(cat_thetas), 4))
+        for col, (cat, theta) in zip(prof_cols, cat_thetas.items()):
+            prof      = irt.theta_to_proficiency(theta)
+            responses = cat_responses.get(cat, [])
+            se        = irt.se_theta(responses)
+            n_ans     = len(responses)
+            color     = prof["color"]
+            with col:
+                st.markdown(f"""
+                <div style="background:white;border-radius:12px;padding:1rem;
+                            border-top:3px solid {color};text-align:center;
+                            box-shadow:0 1px 6px rgba(0,0,0,0.06)">
+                    <div style="font-size:0.82rem;font-weight:700;color:#1e1b4b;
+                                margin-bottom:6px">{cat.split()[0]}</div>
+                    <div style="font-size:1.4rem;font-weight:800;color:{color}">
+                        {prof['score']:.0f}%
+                    </div>
+                    <div style="background:{color};color:white;border-radius:4px;
+                                padding:2px 8px;font-size:0.72rem;font-weight:700;
+                                display:inline-block;margin:4px 0">
+                        {prof['label']}
+                    </div>
+                    <div style="font-size:0.72rem;color:#94a3b8;margin-top:4px">
+                        θ = {theta:+.3f} · SE = {se:.2f}
+                    </div>
+                    <div style="font-size:0.72rem;color:#94a3b8">
+                        {n_ans} question(s) answered
+                    </div>
+                </div>""", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
     if summary.get("category_averages"):
         st.markdown('<div class="content-card">', unsafe_allow_html=True)
         st.markdown('<div class="section-label">Score by Category</div>', unsafe_allow_html=True)
@@ -718,6 +996,30 @@ elif st.session_state.stage == "results":
                     <div class="cat-fill" style="width:{pct}%;background:{c_color}"></div>
                 </div>
             </div>""", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Likert self-assessment summary ───────────────────────────── #
+    if summary.get("likert_submitted", 0) > 0:
+        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">📊 Self-Assessment Calibration</div>', unsafe_allow_html=True)
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        avg_ss = summary.get("avg_self_assessment", 0)
+        with lc1:
+            st.markdown(f'''<div class="metric-card" style="border-top-color:#7c3aed">
+                <div class="metric-val" style="color:#7c3aed">{avg_ss}/10</div>
+                <div class="metric-label">Avg Self-Score</div></div>''', unsafe_allow_html=True)
+        with lc2:
+            st.markdown(f'''<div class="metric-card" style="border-top-color:#16a34a">
+                <div class="metric-val" style="color:#16a34a">{summary["accurate_count"]}</div>
+                <div class="metric-label">Accurate ✅</div></div>''', unsafe_allow_html=True)
+        with lc3:
+            st.markdown(f'''<div class="metric-card" style="border-top-color:#d97706">
+                <div class="metric-val" style="color:#d97706">{summary["overconfident_count"]}</div>
+                <div class="metric-label">Overconfident ⚠️</div></div>''', unsafe_allow_html=True)
+        with lc4:
+            st.markdown(f'''<div class="metric-card" style="border-top-color:#3b82f6">
+                <div class="metric-val" style="color:#3b82f6">{summary["underconfident_count"]}</div>
+                <div class="metric-label">Underconfident 💡</div></div>''', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     col_s, col_i = st.columns(2)
@@ -740,19 +1042,35 @@ elif st.session_state.stage == "results":
         type_icon  = {"conceptual":"💡","practical":"🔧","scenario":"🎬","project":"🗂️"}.get(q.get("type",""),"❓")
         confidence = q.get("confidence", "high")
         conf_icon  = {"high":"✅","medium":"⚠️","low":"🔴"}.get(confidence, "✅")
+        q_uid_r    = q.get("question_id", str(idx))
         with st.expander(
-            f"{type_icon} Q{answered_qs[idx]+1}  ·  {q.get('skill','')}  ·  "
-            f"{ev['total_score']}/100  ·  {ev['grade']}  ·  "
+            f"{type_icon} Q{idx+1}  ·  {q.get('skill','')}  ·  "
+            f"{ev['total_score']}/100  ·  {ev.get('grade','')}  ·  "
             f"{conf_icon} {confidence.capitalize()} confidence"
         ):
             st.markdown(f"**Question:** {q.get('question','')}")
-            st.markdown(f"**Your Answer:** {st.session_state.answers.get(answered_qs[idx],'—')}")
+            st.markdown(f"**Your Answer:** {st.session_state.answers.get(q_uid_r,'—')}")
             st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-            col_sc, col_bd = st.columns([1, 2])
-            with col_sc:
-                render_score(ev["total_score"], ev["grade"])
-            with col_bd:
-                render_breakdown(ev.get("breakdown", {}))
+            lk     = ev.get("likert", 0)
+            lcolor = ev.get("likert_color", "#64748b")
+            lemoji = ev.get("likert_emoji", "")
+            llabel = ev.get("likert_label", "")
+            lscore = ev.get("total_score", 0)
+            stars  = " ".join([
+                f'<span style="opacity:{1.0 if i<=lk else 0.2}">⭐</span>'
+                for i in range(1, 6)
+            ])
+            st.markdown(f'''
+            <div style="display:flex;align-items:center;gap:12px;
+                        background:#f8fafc;border-radius:10px;
+                        padding:0.8rem 1rem;border:1.5px solid {lcolor}">
+                <div style="font-size:1.8rem">{lemoji}</div>
+                <div>
+                    <div style="font-weight:700;color:{lcolor}">{lk}/5 — {llabel}</div>
+                    <div style="font-size:0.78rem;color:#64748b">Score: {lscore}/100</div>
+                </div>
+                <div style="margin-left:auto">{stars}</div>
+            </div>''', unsafe_allow_html=True)
             col_a, col_b = st.columns(2)
             with col_a:
                 for s in ev.get("strengths", []):

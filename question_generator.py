@@ -2,25 +2,29 @@
 question_generator.py
 
 Generates interview questions using:
-  1. Few-shot learning from LIVE open datasets (GitHub raw URLs, no auth needed)
-  2. Chain-of-Thought (CoT) reasoning — LLM thinks before writing
+  1. Few-shot learning from live GitHub datasets
+  2. Chain-of-Thought (CoT) reasoning
   3. Dual-model validation with auto-retry (Llama + Mixtral)
+  4. IRT b_param tagging — each question gets a difficulty estimate
 
-DATASET SOURCES (all freely accessible, no API key required):
-  - github.com/aershov24/full-stack-interview-questions   → Full Stack, JS, SQL, OOP
-  - github.com/zhiqiangzhongddu/Data-Science-Interview-Questions-... → ML, DS, Stats
-  - github.com/sudheerj/javascript-interview-questions   → JavaScript
-  - github.com/sudheerj/reactjs-interview-questions      → React
-  - github.com/Devinterview-io/python-interview-questions → Python
+IRT INTEGRATION (Option 1 — Generate all upfront):
+  For each skill, generates questions across ALL difficulty levels:
+    Easy   (b = -1.5 to -0.5) — basic recall / definition
+    Medium (b = -0.5 to +0.5) — understanding / comparison
+    Hard   (b = +0.5 to +1.5) — application / analysis
 
-NOTE on Kaggle datasets:
-  Kaggle requires login + API key for direct CSV download — not usable at runtime
-  without credentials. These GitHub repos are the best freely-accessible alternative.
+  Total per skill = questions_per_skill × 3 difficulty levels
+  e.g. questions_per_skill=1 → 3 questions per skill (1 easy + 1 medium + 1 hard)
 
-ARCHITECTURE:
-  Startup  → FewShotLoader fetches + parses + caches Q&A pairs per category
-  Per call → _get_few_shot_examples() samples 2 fresh examples for the prompt
-  Prompt   → CoT reasoning block → final JSON output
+  During interview, IRT picks from this pool where b ≈ current θ.
+  This matches exactly what the PDF guide and senior's notebook do.
+
+b_param scale (from PDF guide):
+  -2.0 → Trivially easy (factual recall)
+  -1.0 → Easy (basic understanding)
+   0.0 → Medium (average student has 50/50 chance)
+  +1.0 → Hard (requires strong understanding)
+  +2.0 → Very hard (expert-level synthesis)
 """
 
 import os
@@ -31,6 +35,8 @@ import time
 import threading
 import requests
 from groq import Groq
+from dotenv import load_dotenv
+load_dotenv()
 
 try:
     from sentence_transformers import SentenceTransformer, util as st_util
@@ -41,8 +47,22 @@ except ImportError:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# DATASET CONFIGURATION
-# Each entry: { "url": raw GitHub URL, "categories": [app category names] }
+# IRT DIFFICULTY BANDS
+# b_param ranges for each difficulty level (from PDF guide)
+# ─────────────────────────────────────────────────────────────────────────────
+
+IRT_BANDS = {
+    "easy":   {"b_min": -1.8, "b_max": -0.5, "b_target": -1.0,
+               "description": "Basic recall or definition — any fresher should know this"},
+    "medium": {"b_min": -0.5, "b_max": +0.5, "b_target":  0.0,
+               "description": "Understanding and comparison — average student has 50/50 chance"},
+    "hard":   {"b_min": +0.5, "b_max": +1.8, "b_target": +1.0,
+               "description": "Application, analysis, edge cases — requires strong understanding"},
+}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DATASET SOURCES (few-shot examples)
 # ─────────────────────────────────────────────────────────────────────────────
 
 DATASET_SOURCES = [
@@ -69,98 +89,60 @@ DATASET_SOURCES = [
     },
 ]
 
-# Fallback hardcoded examples — used when all URLs fail (no network, etc.)
 FALLBACK_EXAMPLES: dict[str, list[dict]] = {
     "Programming Languages": [
         {"q": "What is the difference between a list and a tuple in Python?",
-         "a": "A list is mutable — you can change its elements after creation. "
-              "A tuple is immutable — once created its values cannot be changed. "
-              "Tuples are faster and used for fixed data like coordinates."},
+         "a": "A list is mutable. A tuple is immutable. Tuples are faster and used for fixed data."},
         {"q": "What is the difference between == and .equals() in Java?",
-         "a": "== checks if two references point to the same memory location. "
-              ".equals() checks if two objects have the same value. "
-              "For strings always use .equals() to compare values."},
+         "a": "== checks reference equality. .equals() checks value equality. Always use .equals() for strings."},
     ],
     "Frontend Development": [
         {"q": "What is the difference between state and props in React?",
-         "a": "Props are read-only inputs passed from parent to child component. "
-              "State is internal data managed by the component that can change over time. "
-              "When state changes React re-renders the component."},
+         "a": "Props are read-only inputs from parent. State is internal data that can change. State changes trigger re-render."},
         {"q": "What is the CSS box model?",
-         "a": "The box model describes rectangular boxes around HTML elements. "
-              "It has four layers: content, padding, border, and margin from inside out."},
+         "a": "The box model has four layers: content, padding, border, and margin from inside out."},
     ],
     "Backend Development": [
         {"q": "What is the difference between GET and POST HTTP methods?",
-         "a": "GET retrieves data and sends parameters in the URL. "
-              "POST sends data in the request body for creating or submitting data. "
-              "POST is more secure for sensitive data since it is not visible in the URL."},
+         "a": "GET retrieves data with params in URL. POST sends data in request body. POST is more secure for sensitive data."},
         {"q": "What is middleware in Express.js?",
-         "a": "Middleware is a function that runs between the request and response. "
-              "It can modify the request, response, or call next() to pass control forward. "
-              "Used for authentication, logging, and parsing request bodies."},
+         "a": "Middleware runs between request and response. Used for authentication, logging, parsing bodies."},
     ],
     "Databases": [
         {"q": "What is the difference between a primary key and a foreign key?",
-         "a": "A primary key uniquely identifies each row and cannot be null. "
-              "A foreign key references the primary key of another table. "
-              "It maintains relationships and referential integrity between tables."},
-        {"q": "What is normalization and why is it used?",
-         "a": "Normalization organizes a database to reduce data redundancy. "
-              "It divides large tables into smaller related ones. "
-              "It prevents update anomalies where the same data exists in multiple places."},
+         "a": "Primary key uniquely identifies each row. Foreign key references another table's primary key."},
+        {"q": "What is normalization?",
+         "a": "Normalization reduces data redundancy by organizing tables. Prevents update anomalies."},
     ],
     "Cloud & DevOps": [
         {"q": "What is Docker and why is it used?",
-         "a": "Docker packages an application and its dependencies into a container. "
-              "This ensures the app runs the same way on any machine. "
-              "It solves the works-on-my-machine problem."},
+         "a": "Docker packages an app and dependencies into a container. Ensures same behaviour on any machine."},
         {"q": "What is the difference between Git merge and Git rebase?",
-         "a": "Merge combines two branches and creates a merge commit preserving history. "
-              "Rebase moves commits onto another branch creating a cleaner linear history. "
-              "Rebase should not be used on public shared branches."},
+         "a": "Merge creates a merge commit preserving history. Rebase creates a cleaner linear history."},
     ],
     "Data Science & AI": [
         {"q": "What is the difference between supervised and unsupervised learning?",
-         "a": "Supervised learning trains on labeled data where the correct output is known. "
-              "Unsupervised learning finds hidden patterns in unlabeled data. "
-              "Clustering and dimensionality reduction are common unsupervised techniques."},
+         "a": "Supervised uses labeled data. Unsupervised finds patterns in unlabeled data."},
         {"q": "What is overfitting and how do you prevent it?",
-         "a": "Overfitting is when a model learns training data too well including noise. "
-              "It performs poorly on new unseen data. "
-              "Prevention includes cross-validation regularization and adding more data."},
+         "a": "Overfitting is when model learns noise in training data. Prevent with cross-validation and regularization."},
     ],
     "DSA & CS Fundamentals": [
         {"q": "What is the difference between a stack and a queue?",
-         "a": "A stack follows LIFO — last element added is first removed. "
-              "A queue follows FIFO — first element added is first removed. "
-              "Stacks are used in function calls, queues in task scheduling."},
-        {"q": "What are the four pillars of Object-Oriented Programming?",
-         "a": "Encapsulation, Abstraction, Inheritance, and Polymorphism. "
-              "Encapsulation bundles data and restricts access. "
-              "Inheritance lets a class reuse properties of another class."},
-        {"q": "What is the time complexity of binary search?",
-         "a": "Binary search is O(log n). "
-              "At each step it halves the search space by comparing with the middle element. "
-              "It only works on sorted arrays."},
+         "a": "Stack is LIFO. Queue is FIFO. Stacks used for function calls, queues for scheduling."},
+        {"q": "What are the four pillars of OOP?",
+         "a": "Encapsulation, Abstraction, Inheritance, Polymorphism."},
     ],
     "Mobile Development": [
         {"q": "What is the difference between an Activity and a Fragment in Android?",
-         "a": "An Activity represents a full screen with its own lifecycle. "
-              "A Fragment is a reusable portion of UI that lives inside an Activity. "
-              "Fragments allow modular UI design especially on larger screens."},
+         "a": "Activity is a full screen. Fragment is a reusable UI portion inside an Activity."},
     ],
     "Testing & QA": [
-        {"q": "What is unit testing and why is it important?",
-         "a": "Unit testing tests individual functions or components in isolation. "
-              "It ensures each part works before integrating with others. "
-              "Pytest and JUnit are popular frameworks."},
+        {"q": "What is unit testing?",
+         "a": "Unit testing tests individual functions in isolation. Ensures each part works before integration."},
     ],
     "Soft Skills & Methodologies": [
-        {"q": "What is Agile methodology and how is it different from Waterfall?",
-         "a": "Agile is iterative — work is done in short sprints with frequent feedback. "
-              "Waterfall is sequential — each phase completes before the next starts. "
-              "Agile is more flexible for changing requirements."},
+        {"q": "What is Agile methodology?",
+         "a": "Agile is iterative development in short sprints with frequent feedback. More flexible than Waterfall."},
     ],
 }
 FALLBACK_EXAMPLES["default"] = FALLBACK_EXAMPLES["DSA & CS Fundamentals"]
@@ -168,37 +150,20 @@ FALLBACK_EXAMPLES["default"] = FALLBACK_EXAMPLES["DSA & CS Fundamentals"]
 
 # ─────────────────────────────────────────────────────────────────────────────
 # FEW-SHOT LOADER
-# Fetches datasets at startup in a background thread — non-blocking.
-# Falls back to FALLBACK_EXAMPLES if any URL fails.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class FewShotLoader:
-    """
-    Loads real interview Q&A pairs from public GitHub raw URLs.
-    Runs in a background thread so it doesn't block app startup.
-    Falls back to hardcoded examples if fetch fails.
-
-    Why GitHub raw URLs, not Kaggle?
-      Kaggle datasets require API key authentication.
-      These GitHub repos are publicly accessible with no credentials.
-    """
-
-    TIMEOUT  = 8     # seconds per request
-    MAX_QA   = 30    # max Q&A pairs to keep per category (to limit memory)
+    TIMEOUT  = 8
+    MAX_QA   = 30
 
     def __init__(self):
         self._cache: dict[str, list[dict]] = {}
         self._loaded = False
         self._lock   = threading.Lock()
-        # Start loading in background immediately
         self._thread = threading.Thread(target=self._load_all, daemon=True)
         self._thread.start()
 
     def get_examples(self, category: str, n: int = 2) -> list[dict]:
-        """
-        Returns n random Q&A examples for the given category.
-        If background loading is still running, uses fallback immediately.
-        """
         with self._lock:
             pool = self._cache.get(category) or \
                    FALLBACK_EXAMPLES.get(category) or \
@@ -210,33 +175,21 @@ class FewShotLoader:
         return self._loaded
 
     def _load_all(self):
-        """Fetch all dataset URLs and populate the cache."""
         combined: dict[str, list[dict]] = {}
-
         for source in DATASET_SOURCES:
-            url         = source["url"]
-            categories  = source["categories"]
-            description = source["description"]
             try:
-                resp = requests.get(url, timeout=self.TIMEOUT)
+                resp = requests.get(source["url"], timeout=self.TIMEOUT)
                 resp.raise_for_status()
                 pairs = self._parse_markdown_qa(resp.text)
-                print(f"[FewShotLoader] ✅ {description}: {len(pairs)} Q&A pairs fetched")
-
-                for cat in categories:
-                    if cat not in combined:
-                        combined[cat] = []
-                    combined[cat].extend(pairs)
-
+                print(f"[FewShot] {source['description']}: {len(pairs)} Q&A fetched")
+                for cat in source["categories"]:
+                    combined.setdefault(cat, []).extend(pairs)
             except Exception as e:
-                print(f"[FewShotLoader] ⚠️  {description}: fetch failed ({e}). "
-                      f"Using fallback examples.")
+                print(f"[FewShot] {source['description']}: failed ({e}). Using fallback.")
 
-        # Deduplicate and cap per category
         with self._lock:
             for cat, pairs in combined.items():
-                seen = set()
-                unique = []
+                seen, unique = set(), []
                 for p in pairs:
                     key = p["q"][:60].lower()
                     if key not in seen:
@@ -245,76 +198,30 @@ class FewShotLoader:
                 self._cache[cat] = unique[:self.MAX_QA]
             self._loaded = True
 
-        loaded_cats = [c for c, v in self._cache.items() if v]
-        print(f"[FewShotLoader] Loaded {len(loaded_cats)} categories from live datasets.")
-
     def _parse_markdown_qa(self, text: str) -> list[dict]:
-        """
-        Parses Q&A pairs from markdown files.
-        Handles common patterns found in interview Q&A repos:
-
-          Pattern 1 (numbered): #### Q123 What is X?\nAnswer text
-          Pattern 2 (bold Q):   **What is X?**\n\nAnswer text
-          Pattern 3 (heading):  ### What is X?\nAnswer text
-        """
         pairs = []
-
-        # Pattern 1 — numbered: #### Q123 question?
-        for m in re.finditer(
-            r'#{2,5}\s+Q\d+\.?\s*(.+?)\n+([\s\S]+?)(?=\n#{2,5}|\Z)',
-            text
-        ):
+        for m in re.finditer(r'#{2,5}\s+Q\d+\.?\s*(.+?)\n+([\s\S]+?)(?=\n#{2,5}|\Z)', text):
             q = m.group(1).strip()
             a = self._clean_answer(m.group(2))
-            if self._is_valid_qa(q, a):
+            if self._is_valid(q, a):
                 pairs.append({"q": q, "a": a})
-
-        # Pattern 2 — bold question with answer block
-        for m in re.finditer(
-            r'\*\*\s*(\d+\.\s+)?(.{15,150}\??)\s*\*\*\s*\n+\s*([\s\S]+?)(?=\n\s*\*\*|\Z)',
-            text
-        ):
+        for m in re.finditer(r'\*\*\s*(\d+\.\s+)?(.{15,150}\??)\s*\*\*\s*\n+([\s\S]+?)(?=\n\s*\*\*|\Z)', text):
             q = m.group(2).strip()
             a = self._clean_answer(m.group(3))
-            if self._is_valid_qa(q, a):
+            if self._is_valid(q, a):
                 pairs.append({"q": q, "a": a})
-
-        # Pattern 3 — heading as question
-        for m in re.finditer(
-            r'#{2,4}\s+(.{15,120}\?)\s*\n+([\s\S]+?)(?=\n#{2,4}|\Z)',
-            text
-        ):
-            q = m.group(1).strip()
-            a = self._clean_answer(m.group(2))
-            if self._is_valid_qa(q, a):
-                pairs.append({"q": q, "a": a})
-
         return pairs
 
     def _clean_answer(self, raw: str) -> str:
-        """Strip markdown, code blocks, links, keep plain text answer."""
-        text = re.sub(r'```[\s\S]*?```', '', raw)          # code blocks
-        text = re.sub(r'`[^`]+`', lambda m: m.group()[1:-1], text)  # inline code
-        text = re.sub(r'!?\[([^\]]*)\]\([^\)]*\)', r'\1', text)     # links/images
-        text = re.sub(r'[*_]{1,2}([^*_]+)[*_]{1,2}', r'\1', text)  # bold/italic
-        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)       # headings
-        text = re.sub(r'^\s*[-*+>]\s+', '', text, flags=re.MULTILINE) # bullets
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = re.sub(r'[ \t]{2,}', ' ', text)
-        # Collapse to single paragraph, max 400 chars
-        flat = ' '.join(text.split())
-        return flat[:400]
+        text = re.sub(r'```[\s\S]*?```', '', raw)
+        text = re.sub(r'!?\[([^\]]*)\]\([^\)]*\)', r'\1', text)
+        text = re.sub(r'[*_]{1,2}([^*_]+)[*_]{1,2}', r'\1', text)
+        text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+        text = re.sub(r'^\s*[-*+>]\s+', '', text, flags=re.MULTILINE)
+        return ' '.join(text.split())[:400]
 
-    def _is_valid_qa(self, q: str, a: str) -> bool:
-        """Basic quality filter — skip too-short, code-heavy, or non-question entries."""
-        if len(q) < 15 or len(a) < 30:
-            return False
-        if q.count('\n') > 2:
-            return False
-        # Skip entries that are mostly code
-        if a.count('{') + a.count('}') > 10:
-            return False
-        return True
+    def _is_valid(self, q: str, a: str) -> bool:
+        return len(q) >= 15 and len(a) >= 30 and q.count('\n') <= 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -323,13 +230,13 @@ class FewShotLoader:
 
 class QuestionGenerator:
 
-    VALIDATOR_MODEL = "mixtral-8x7b-32768"
+    VALIDATOR_MODEL = "llama-3.1-8b-instant"
     MAX_RETRIES     = 2
 
     def __init__(self):
-        self.client     = Groq(api_key=os.environ.get("GROQ_API_KEY"))
-        self.model      = "llama-3.3-70b-versatile"
-        self.few_shot   = FewShotLoader()   # starts background fetch immediately
+        self.client   = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+        self.model    = "llama-3.3-70b-versatile"
+        self.few_shot = FewShotLoader()
 
         if _ST_AVAILABLE:
             self._st_model = SentenceTransformer("all-MiniLM-L6-v2")
@@ -337,16 +244,37 @@ class QuestionGenerator:
             self._st_model = None
 
     # ──────────────────────────────────────────────────────────────────── #
-    #  PUBLIC                                                               #
+    #  PUBLIC: generate_questions                                           #
     # ──────────────────────────────────────────────────────────────────── #
 
     def generate_questions(
         self,
         skills_data:         dict,
-        difficulty:          str = "medium",
-        questions_per_skill: int = 2,
+        questions_per_skill: int = 5,   # per difficulty level — fixed at 5 for IRT
+                                         # total = questions_per_skill × 3
         resume_text:         str = "",
     ) -> list[dict]:
+        """
+        Generates questions across all 3 difficulty levels per skill.
+
+        questions_per_skill=1 → 3 questions per skill (1 easy + 1 medium + 1 hard)
+        questions_per_skill=2 → 6 questions per skill (2 easy + 2 medium + 2 hard)
+
+        Each question has:
+          b_param       : IRT difficulty estimate (-2.0 to +2.0)
+          b_reasoning   : LLaMA's explanation for the b value
+          difficulty    : easy / medium / hard
+          question_id   : unique string for IRT tracking (asked_ids)
+
+        Returns flat list of question dicts — NOT shuffled.
+        IRT engine will pick from this pool using b ≈ θ.
+        """
+        api_key = os.environ.get("GROQ_API_KEY", "")
+        if not api_key or not api_key.startswith("gsk_"):
+            raise RuntimeError(
+                "GROQ_API_KEY is missing or invalid. "
+                "Add it to your .env or .secrets.toml file."
+            )
 
         session_seed = f"{int(time.time())}-{random.randint(1000, 9999)}"
 
@@ -360,36 +288,45 @@ class QuestionGenerator:
         qid = 1
 
         for skill_name, category in all_skills:
-            skill_qs = self._generate_for_skill(
-                skill_name, category, difficulty, questions_per_skill, session_seed
-            )
-            for q in skill_qs:
-                q["id"] = qid
-                q = self._validate_with_retry(q, skill_name, category, difficulty, session_seed)
-                questions.append(q)
-                qid += 1
-
-        if resume_text:
-            for project in self._extract_projects(resume_text):
-                for q in self._generate_for_project(project, difficulty, session_seed):
-                    q["id"]         = qid
-                    q["confidence"] = "high"
-                    q["similarity"] = 1.0
+            # Generate questions for each difficulty level
+            for difficulty in ["easy", "medium", "hard"]:
+                skill_qs = self._generate_for_skill(
+                    skill_name, category, difficulty,
+                    questions_per_skill, session_seed
+                )
+                for q in skill_qs:
+                    q["id"]          = qid
+                    q["question_id"] = f"q_{qid}_{skill_name[:3].lower()}_{difficulty[0]}"
+                    q = self._validate_with_retry(
+                        q, skill_name, category, difficulty, session_seed
+                    )
                     questions.append(q)
                     qid += 1
 
-        random.shuffle(questions)
-        for i, q in enumerate(questions, 1):
-            q["id"] = i
+        # Project questions
+        if resume_text:
+            for project in self._extract_projects(resume_text):
+                for q in self._generate_for_project(project, session_seed):
+                    q["id"]          = qid
+                    q["question_id"] = f"q_{qid}_proj"
+                    q["confidence"]  = "high"
+                    q["similarity"]  = 1.0
+                    q["b_param"]     = 0.0   # project questions default medium
+                    q["b_reasoning"] = "Project question — default medium difficulty"
+                    questions.append(q)
+                    qid += 1
 
+        # DO NOT shuffle — IRT picks from pool by b ≈ θ
+        # App will use select_question() from rasch_engine
         return questions
 
     # ──────────────────────────────────────────────────────────────────── #
-    #  SKILL QUESTION GENERATION  (CoT + Live Few-Shot)                    #
+    #  SKILL QUESTION GENERATION  (CoT + Few-Shot + IRT b_param)           #
     # ──────────────────────────────────────────────────────────────────── #
 
     def _generate_for_skill(self, skill_name, category, difficulty, count, seed):
 
+        band = IRT_BANDS[difficulty]
         angles = random.sample([
             "definition and purpose of the concept",
             "difference between two related concepts in this skill",
@@ -398,18 +335,17 @@ class QuestionGenerator:
             "advantages and disadvantages",
             "what happens if it is misused or incorrectly applied",
             "how it compares to an alternative approach",
-            "a follow-up a real interviewer would naturally ask next",
             "a practical example that demonstrates the concept",
             "the types or categories within this concept",
+            "a common follow-up a real interviewer would ask",
         ], k=min(count, 10))
 
-        # Get live examples from fetched datasets (or fallback)
         examples     = self.few_shot.get_examples(category, n=2)
         source_note  = "live dataset" if self.few_shot.is_loaded else "reference examples"
         few_shot_str = self._format_examples(examples, source_note)
 
-        prompt = f"""You are a senior technical interviewer at a software company conducting
-a campus placement interview for a fresher (B.Tech/B.E. CS/IT student).
+        prompt = f"""You are a senior technical interviewer conducting a campus placement
+interview for a fresher (B.Tech/B.E. CS/IT student).
 SESSION SEED: {seed}
 
 ════════════════════════════════════════════════════════════
@@ -418,77 +354,74 @@ TASK
 Generate exactly {count} interview question(s) for:
   Skill:      {skill_name}
   Category:   {category}
-  Difficulty: {difficulty}
-  Angle(s):   {", ".join(angles[:count])}
+  Difficulty: {difficulty.upper()}
+
+DIFFICULTY DEFINITION for {difficulty.upper()}:
+  {band['description']}
+
+IRT b_param target: {band['b_target']} (range: {band['b_min']} to {band['b_max']})
+  b scale:
+    -2.0 → trivially easy (any student gets it)
+    -1.0 → easy (basic understanding)
+     0.0 → medium (average student 50/50 chance)
+    +1.0 → hard (requires strong understanding)
+    +2.0 → very hard (expert level)
 
 ════════════════════════════════════════════════════════════
 REAL INTERVIEW EXAMPLES  ({source_note})
-Study these carefully. Your output must match this tone and length.
+Study these carefully. Match this tone and length exactly.
 ════════════════════════════════════════════════════════════
 {few_shot_str}
 ════════════════════════════════════════════════════════════
-STYLE RULES  (derived from real interview Q&A datasets)
+STYLE RULES
 ════════════════════════════════════════════════════════════
-  ✅ Questions are SHORT — 1 sentence or 2 short sentences max
-  ✅ Questions are DIRECT — no long setups or scenarios
-  ✅ Start with: What is / What are / Explain / How does /
-     What is the difference between / When would you use / Why is / Give an example of
-  ✅ Answers are 3-5 sentences — clear, structured, explain the "why" not just "what"
-  ❌ NEVER start with "You are working at..." or "Imagine a scenario..."
-  ❌ NEVER write questions longer than 2 sentences
+  ✅ Questions are SHORT — 1-2 sentences max
+  ✅ DIRECT — no long setups or scenarios
+  ✅ Start with: What is / Explain / How does / Why / What is the difference
+  ✅ Model answer: 3-5 sentences, clear, explains the "why"
+  ❌ NEVER use "You are working at..." or "Imagine a scenario..."
 
 ════════════════════════════════════════════════════════════
-STEP 1 — THINK FIRST  (Chain of Thought)
+STEP 1 — THINK FIRST (Chain of Thought)
 ════════════════════════════════════════════════════════════
-Reason inside a <reasoning> block:
-  a) What key concept must a fresher know about {skill_name}?
-  b) Which angle best tests it?
-  c) Write a BAD version first (scenario/too long/vague).
-  d) What makes it bad?
-  e) Rewrite as a GOOD question matching the examples above.
-  f) Write a model answer in 3-5 sentences.
-  g) Write 2 hints that guide without giving away the answer.
+Inside a <reasoning> block:
+  a) What key concept should a {difficulty} question test for {skill_name}?
+  b) Write the question
+  c) Write the model answer
+  d) Estimate b_param within {band['b_min']} to {band['b_max']} — explain why
 
 <reasoning>
-[thinking here — one block per question]
+[thinking here]
 </reasoning>
 
 ════════════════════════════════════════════════════════════
-STEP 2 — OUTPUT FINAL JSON  (no extra text, no markdown)
+STEP 2 — OUTPUT FINAL JSON (no extra text, no markdown)
 ════════════════════════════════════════════════════════════
 [
   {{
     "skill":        "{skill_name}",
     "category":     "{category}",
     "difficulty":   "{difficulty}",
-    "question":     "<final question from step e>",
-    "type":         "<conceptual | practical | scenario>",
+    "question":     "<question>",
+    "type":         "<conceptual|practical|scenario>",
     "hints":        ["<hint 1>", "<hint 2>"],
-    "model_answer": "<answer from step f>"
+    "model_answer": "<3-5 sentence answer>",
+    "b_param":      <float between {band['b_min']} and {band['b_max']}>,
+    "b_reasoning":  "<one sentence: why this b value>"
   }}
 ]
 """
-        return self._call_llm_cot(prompt, context=f"skill '{skill_name}'")
+        return self._call_llm_cot(prompt, context=f"skill '{skill_name}' [{difficulty}]")
 
     # ──────────────────────────────────────────────────────────────────── #
-    #  PROJECT QUESTION GENERATION  (CoT + Few-Shot)                       #
+    #  PROJECT QUESTION GENERATION                                          #
     # ──────────────────────────────────────────────────────────────────── #
 
-    def _generate_for_project(self, project, difficulty, seed):
+    def _generate_for_project(self, project, seed):
         title      = project.get("title", "Unnamed Project")
         desc       = project.get("description", "")
         techs      = ", ".join(project.get("technologies", []))
         highlights = "; ".join(project.get("highlights", []))
-
-        project_examples = """Example 1:
-  Q: Why did you choose React over plain JavaScript for the frontend?
-  A: React makes it easy to build reusable components and manage state. Without React,
-     updating the DOM manually for dynamic content like live quiz scores would be complex.
-
-Example 2:
-  Q: How did you handle errors when the external API returned no data?
-  A: I wrapped the API call in a try-except block. The app shows a user-friendly message
-     instead of crashing, and falls back to cached data from the database."""
 
         prompt = f"""You are interviewing a fresher about a project they built.
 SESSION SEED: {seed}
@@ -498,38 +431,24 @@ Description: {desc}
 Technologies: {techs}
 Highlights: {highlights}
 
-════════════════════════════════════════════════════════════
-PROJECT INTERVIEW EXAMPLES
-════════════════════════════════════════════════════════════
-{project_examples}
-
-════════════════════════════════════════════════════════════
-STEP 1 — THINK FIRST  (Chain of Thought)
-════════════════════════════════════════════════════════════
-For each of the 2 questions, reason inside <reasoning>:
-  a) Most revealing thing to ask about THIS project?
-  b) Bad version — too generic, could be any project.
-  c) Why is it bad?
-  d) Good version — specific to the project above, short, direct.
-  e) Strong fresher answer (3-4 sentences).
-  f) 1 hint.
+Generate 1 specific question about this project.
+Ask about a technical decision, challenge faced, or lesson learned.
 
 <reasoning>
 [thinking here]
 </reasoning>
 
-════════════════════════════════════════════════════════════
-STEP 2 — OUTPUT FINAL JSON
-════════════════════════════════════════════════════════════
 [
   {{
     "skill":        "{title}",
     "category":     "Project",
-    "difficulty":   "{difficulty}",
+    "difficulty":   "medium",
     "question":     "<specific project question>",
     "type":         "project",
     "hints":        ["<1 hint>"],
-    "model_answer": "<3-4 sentence fresher answer>"
+    "model_answer": "<3-4 sentence fresher answer>",
+    "b_param":      0.0,
+    "b_reasoning":  "Project question — default medium difficulty"
   }}
 ]
 """
@@ -543,8 +462,9 @@ STEP 2 — OUTPUT FINAL JSON
         best_q, best_sim = q, -1.0
 
         for attempt in range(self.MAX_RETRIES + 1):
-            val  = self._validate_model_answer(q["question"], skill_name,
-                                               q.get("model_answer", ""))
+            val  = self._validate_model_answer(
+                q["question"], skill_name, q.get("model_answer", "")
+            )
             sim  = val["similarity"]
             conf = val["confidence"]
 
@@ -553,13 +473,9 @@ STEP 2 — OUTPUT FINAL JSON
                 best_q   = {**q, "confidence": conf, "similarity": sim}
 
             if sim >= 0.60:
-                print(f"[QGen] '{skill_name}' attempt {attempt+1}: "
-                      f"sim={sim:.2f} ({conf}) ✅")
                 return best_q
 
             if attempt < self.MAX_RETRIES:
-                print(f"[QGen] '{skill_name}' attempt {attempt+1}: "
-                      f"sim={sim:.2f} < 0.60 → regenerating…")
                 regen = self._generate_for_skill(
                     skill_name, category, difficulty, 1,
                     f"{int(time.time())}-{random.randint(1000, 9999)}"
@@ -567,8 +483,6 @@ STEP 2 — OUTPUT FINAL JSON
                 if regen:
                     q = regen[0]
             else:
-                print(f"[QGen] '{skill_name}': retries exhausted. "
-                      f"Best sim={best_sim:.2f}. Tagging 'medium'.")
                 best_q["confidence"] = "medium"
 
         return best_q
@@ -580,22 +494,20 @@ STEP 2 — OUTPUT FINAL JSON
             resp = self.client.chat.completions.create(
                 model=self.VALIDATOR_MODEL,
                 messages=[
-                    {"role": "system",
-                     "content": "Answer accurately and concisely."},
+                    {"role": "system", "content": "Answer accurately and concisely."},
                     {"role": "user",
-                     "content": f"Skill: {skill}\nQuestion: {question}\n\n"
-                                f"Answer in 3-5 sentences."},
+                     "content": f"Skill: {skill}\nQuestion: {question}\nAnswer in 3-5 sentences."},
                 ],
                 temperature=0.2, max_tokens=300,
             )
             second = resp.choices[0].message.content.strip()
-            e1 = self._st_model.encode(model_answer, convert_to_tensor=True)
-            e2 = self._st_model.encode(second,       convert_to_tensor=True)
+            e1  = self._st_model.encode(model_answer, convert_to_tensor=True)
+            e2  = self._st_model.encode(second,       convert_to_tensor=True)
             sim = float(st_util.cos_sim(e1, e2))
             conf = "high" if sim >= 0.80 else ("medium" if sim >= 0.60 else "low")
             return {"confidence": conf, "similarity": round(sim, 2)}
         except Exception as e:
-            print(f"[QGen] Validation error (non-critical): {e}")
+            print(f"[QGen] Validation error: {e}")
             return {"confidence": "high", "similarity": 1.0}
 
     # ──────────────────────────────────────────────────────────────────── #
@@ -616,7 +528,7 @@ STEP 2 — OUTPUT FINAL JSON
                 ],
                 temperature=0.2, max_tokens=1000,
             )
-            raw = self._clean_json(resp.choices[0].message.content)
+            raw      = self._clean_json(resp.choices[0].message.content)
             projects = json.loads(raw)
             return projects if isinstance(projects, list) else []
         except Exception as e:
@@ -627,7 +539,7 @@ STEP 2 — OUTPUT FINAL JSON
     #  HELPERS                                                              #
     # ──────────────────────────────────────────────────────────────────── #
 
-    def _format_examples(self, examples: list[dict], source: str) -> str:
+    def _format_examples(self, examples, source):
         lines = [f"(sourced from {source})\n"]
         for i, ex in enumerate(examples, 1):
             lines.append(f"Example {i}:")
@@ -637,48 +549,50 @@ STEP 2 — OUTPUT FINAL JSON
         return "\n".join(lines)
 
     def _call_llm_cot(self, prompt: str, context: str = "") -> list[dict]:
-        """CoT call — allows <reasoning> block before the JSON array."""
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system",
-                     "content": ("You are an expert technical interviewer for CS/IT campus "
-                                 "placements. Reason step by step, then output a valid JSON array.")},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.7,
-                max_tokens=2500,
-            )
-            raw = resp.choices[0].message.content.strip()
-            raw = re.sub(r"<reasoning>.*?</reasoning>", "", raw, flags=re.DOTALL).strip()
-            m   = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-            if not m:
-                print(f"[QGen] No JSON found for {context}")
-                return []
-            parsed = json.loads(m.group())
-            return parsed if isinstance(parsed, list) else [parsed]
-        except Exception as e:
-            print(f"[QGen] CoT error for {context}: {e}")
-            return []
-
-    def _call_llm(self, prompt: str, context: str = "") -> list[dict]:
-        try:
-            resp = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system",
-                     "content": "Return valid JSON only, no markdown."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.5, max_tokens=1800,
-            )
-            raw    = self._clean_json(resp.choices[0].message.content)
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, list) else [parsed]
-        except Exception as e:
-            print(f"[QGen] Error for {context}: {e}")
-            return []
+        FALLBACK_MODELS = [
+            "llama-3.3-70b-versatile",
+            "llama-3.1-70b-versatile",
+            "llama-3.1-8b-instant",
+        ]
+        last_error = None
+        for model in FALLBACK_MODELS:
+            try:
+                resp = self.client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system",
+                         "content": ("You are an expert technical interviewer for CS/IT campus "
+                                     "placements. Reason step by step, then output a valid JSON array.")},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.7,
+                    max_tokens=2500,
+                )
+                raw = resp.choices[0].message.content.strip()
+                raw = re.sub(r"<reasoning>.*?</reasoning>", "", raw, flags=re.DOTALL).strip()
+                m   = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+                if not m:
+                    print(f"[QGen] No JSON for {context}")
+                    return []
+                parsed = json.loads(m.group())
+                # Ensure b_param exists and is clamped
+                result = parsed if isinstance(parsed, list) else [parsed]
+                for q in result:
+                    b = float(q.get("b_param", 0.0))
+                    q["b_param"] = max(-2.0, min(2.0, b))
+                    if "b_reasoning" not in q:
+                        q["b_reasoning"] = "LLM estimated"
+                return result
+            except Exception as e:
+                err_str = str(e)
+                if "401" in err_str or "invalid_api_key" in err_str:
+                    raise RuntimeError(
+                        f"Groq API authentication failed. Regenerate key at console.groq.com. Error: {e}"
+                    )
+                last_error = e
+                continue
+        print(f"[QGen] All models failed for {context}: {last_error}")
+        return []
 
     @staticmethod
     def _clean_json(text: str) -> str:
