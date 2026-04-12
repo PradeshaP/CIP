@@ -570,11 +570,32 @@ Ask about a technical decision, challenge faced, or lesson learned.
                 )
                 raw = resp.choices[0].message.content.strip()
                 raw = re.sub(r"<reasoning>.*?</reasoning>", "", raw, flags=re.DOTALL).strip()
-                m   = re.search(r"\[.*\]", raw, flags=re.DOTALL)
-                if not m:
-                    print(f"[QGen] No JSON for {context}")
+                
+                # Extract JSON more robustly — find opening [ and parse char by char
+                start_idx = raw.find('[')
+                if start_idx == -1:
+                    print(f"[QGen] No JSON array found for {context}")
                     return []
-                parsed = json.loads(m.group())
+                
+                # Find matching closing bracket
+                bracket_count = 0
+                end_idx = start_idx
+                for i in range(start_idx, len(raw)):
+                    if raw[i] == '[':
+                        bracket_count += 1
+                    elif raw[i] == ']':
+                        bracket_count -= 1
+                        if bracket_count == 0:
+                            end_idx = i + 1
+                            break
+                
+                if bracket_count != 0:
+                    print(f"[QGen] Mismatched brackets in JSON for {context}")
+                    return []
+                
+                json_str = raw[start_idx:end_idx]
+                parsed = json.loads(json_str)
+                
                 # Ensure b_param exists and is clamped
                 result = parsed if isinstance(parsed, list) else [parsed]
                 for q in result:
