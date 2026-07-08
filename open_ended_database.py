@@ -60,7 +60,7 @@ def test_connection() -> tuple[bool, str]:
 # SESSION MANAGEMENT
 # ─────────────────────────────────────────────────────────────────────────────
 
-def create_oe_session(student_name: str, student_email: str, 
+def create_oe_session(student_name: str, student_email: str,
                       skills_tested: list[str], mode: str = "open_ended") -> str | None:
     """Create a new open-ended session. Returns session_id (UUID string)."""
     conn = _get_conn()
@@ -113,6 +113,9 @@ def store_oe_questions(session_id: str, questions: list[dict]) -> list[dict]:
     Store questions generated for a session.
     Returns list of stored question references:
       [{"session_question_id": str, "question_id": str|None}, ...]
+
+    FIX: question_generator.py outputs the question text under the key "question",
+    but the DB column is question_text. We accept both keys gracefully.
     """
     conn = _get_conn()
     if not conn:
@@ -122,6 +125,10 @@ def store_oe_questions(session_id: str, questions: list[dict]) -> list[dict]:
         with conn:
             with conn.cursor() as cur:
                 for q in questions:
+                    # Accept "question_text" (DB/MCQ convention) or
+                    # "question" (open-ended generator convention)
+                    question_text = q.get("question_text") or q.get("question", "")
+
                     cur.execute("""
                         INSERT INTO oe_session_questions
                             (session_id, skill, category, question_text,
@@ -132,7 +139,7 @@ def store_oe_questions(session_id: str, questions: list[dict]) -> list[dict]:
                         session_id,
                         q.get("skill", ""),
                         q.get("category", ""),
-                        q["question_text"],
+                        question_text,
                         q.get("difficulty", "medium"),
                         q.get("b_param", 0.0),
                         q.get("type", "conceptual"),
@@ -227,7 +234,7 @@ def get_oe_session_responses(session_id: str) -> list[dict]:
         conn.close()
 
 
-def update_oe_session_stats(session_id: str, total_questions: int, 
+def update_oe_session_stats(session_id: str, total_questions: int,
                              total_answered: int, total_score: float):
     """Update session stats after all questions answered."""
     conn = _get_conn()

@@ -126,20 +126,28 @@ def select_question(pool: list[dict], theta: float,
     Tie-breaking: adds tiny random noise (0 to 1e-4) to distance
     so equal-distance questions are not always selected in same order.
     This matches senior's: pool["dist"] + np.random.uniform(0, 1e-4, len(pool))
+
+    FIX: uses .get() for question_id so both MCQ questions (question_id key)
+    and open-ended interview questions (may use id or question_id) are handled
+    gracefully without KeyError.
     """
-    candidates = [q for q in pool if q["question_id"] not in asked_ids]
+    # Defensive key access — support both MCQ pool and open-ended pool
+    candidates = [
+        q for q in pool
+        if q.get("question_id", q.get("id")) not in asked_ids
+    ]
     if not candidates:
         return None
 
     if last_correct is False:
-        easier = [q for q in candidates if q["b_param"] <= theta]
+        easier = [q for q in candidates if q.get("b_param", 0.0) <= theta]
         if easier:
             candidates = easier
 
     # Distance + tiny noise for tie-breaking
     return min(
         candidates,
-        key=lambda q: abs(q["b_param"] - theta) + random.uniform(0, 1e-4)
+        key=lambda q: abs(q.get("b_param", 0.0) - theta) + random.uniform(0, 1e-4)
     )
 
 
@@ -162,7 +170,6 @@ def compute_overall_theta(skill_thetas: dict) -> float:
 # ── SkillSession — mirrors StudentSession from senior's Cell 3 ────────────────
 
 class SkillSession:
-  
 
     def __init__(self, skill: str, quiz_length: int = 15):
         self.skill        = skill
@@ -204,11 +211,11 @@ class SkillSession:
 
         Returns full response record dict.
         """
-        correct_opt = question["correct_option"]
-        is_correct  = (selected_option == correct_opt)
-        b_used      = float(question["b_param"])
-        p_pred      = p_correct(self.theta, b_used)
-        surprise    = int(is_correct) - p_pred
+        correct_opt  = question["correct_option"]
+        is_correct   = (selected_option == correct_opt)
+        b_used       = float(question.get("b_param", 0.0))
+        p_pred       = p_correct(self.theta, b_used)
+        surprise     = int(is_correct) - p_pred
         theta_before = self.theta
 
         # ── 1. Update θ ───────────────────────────────────────────────
@@ -219,43 +226,43 @@ class SkillSession:
         b_after_online = update_b_online(b_used, theta_before, is_correct)
 
         # ── 3. Batch b calibration ────────────────────────────────────
-        # Count how many times this question has been answered (across all sessions)
-        # This is tracked in DB — passed in via question dict if available
-        resp_count = question.get("response_count", 0) + 1
-        corr_count = question.get("correct_count", 0) + (1 if is_correct else 0)
+        resp_count   = question.get("response_count", 0) + 1
+        corr_count   = question.get("correct_count", 0) + (1 if is_correct else 0)
         b_calibrated = calibrate_b(resp_count, corr_count)
         b_final      = b_calibrated if b_calibrated is not None else b_after_online
         b_source     = "calibrated" if b_calibrated is not None else "online"
 
-        # ── 4. Update SE(θ) ───────────────────────────────────────────
-        self.asked_ids.add(question["question_id"])
+        # ── 4. Track asked ID + update SE(θ) — defensive .get() ──────
+        q_id = question.get("question_id", question.get("id"))
+        self.asked_ids.add(q_id)
         self.theta_se = se_theta(self.responses)  # before appending
 
         # ── 5. Build response record ──────────────────────────────────
         record = {
-            "q_number":          len(self.responses) + 1,
-            "question_id":       question["question_id"],
-            "skill":             self.skill,
-            "question_text":     question["question_text"],
-            "selected_option":   selected_option,
-            "correct_option":    correct_opt,
-            "is_correct":        is_correct,
-            "b_used":            b_used,
-            "b_after_online":    b_after_online,
-            "b_final":           b_final,
-            "b_source":          b_source,
-            "theta_before":      theta_before,
-            "theta_after":       self.theta,
-            "p_correct_irt":     round(p_pred, 4),
-            "surprise":          round(surprise, 4),
+            "q_number":           len(self.responses) + 1,
+            "question_id":        q_id,
+            "skill":              self.skill,
+            # Support both "question_text" (MCQ) and "question" (open-ended)
+            "question_text":      question.get("question_text") or question.get("question", ""),
+            "selected_option":    selected_option,
+            "correct_option":     correct_opt,
+            "is_correct":         is_correct,
+            "b_used":             b_used,
+            "b_after_online":     b_after_online,
+            "b_final":            b_final,
+            "b_source":           b_source,
+            "theta_before":       theta_before,
+            "theta_after":        self.theta,
+            "p_correct_irt":      round(p_pred, 4),
+            "surprise":           round(surprise, 4),
             "proficiency_before": round(100.0 / (1.0 + math.exp(-theta_before)), 1),
             "proficiency_after":  round(100.0 / (1.0 + math.exp(-self.theta)), 1),
-            "difficulty_tier":   question.get("difficulty_tier", "medium"),
-            "explanation":       question.get("explanation", ""),
-            "option_a":          question.get("option_a", ""),
-            "option_b":          question.get("option_b", ""),
-            "option_c":          question.get("option_c", ""),
-            "option_d":          question.get("option_d", ""),
+            "difficulty_tier":    question.get("difficulty_tier", "medium"),
+            "explanation":        question.get("explanation", ""),
+            "option_a":           question.get("option_a", ""),
+            "option_b":           question.get("option_b", ""),
+            "option_c":           question.get("option_c", ""),
+            "option_d":           question.get("option_d", ""),
         }
         self.responses.append(record)
         # Update SE after appending
@@ -266,12 +273,12 @@ class SkillSession:
         """Final summary for this skill session."""
         prof = self.proficiency
         return {
-            "skill":             self.skill,
-            "theta_final":       self.theta,
-            "theta_se":          self.theta_se,
-            "proficiency_score": prof["score"],
-            "proficiency_label": prof["label"],
-            "proficiency_color": prof["color"],
+            "skill":              self.skill,
+            "theta_final":        self.theta,
+            "theta_se":           self.theta_se,
+            "proficiency_score":  prof["score"],
+            "proficiency_label":  prof["label"],
+            "proficiency_color":  prof["color"],
             "questions_answered": len(self.responses),
             "questions_correct":  self.correct_count,
             "accuracy_pct":       round(self.correct_count / max(len(self.responses), 1) * 100, 1),

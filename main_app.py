@@ -1,10 +1,10 @@
 """
-main_app.py  —  Unified Interview Coach + Adaptive MCQ
-Merges enhanced_app.py (AI Interview) and mcq_app.py (Adaptive MCQ)
-into a single Streamlit application with a mode switcher.
+main_app.py  —  Unified Interview Coach + LLM MCQ Practice + MCQ Test
+Merges enhanced_app.py (AI Interview), mcq_practice_llm.py (LLM MCQ Practice),
+and a fixed MCQ Test mode into a single Streamlit application
+with a three-button mode switcher.
 
-All original logic is preserved — only the entry point and navigation
-are changed.  Run with:
+Run with:
     streamlit run main_app.py
 """
 
@@ -13,6 +13,7 @@ import math
 import html as html_module
 import streamlit as st
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ── AI Interview imports ──────────────────────────────────────────────────────
@@ -22,10 +23,13 @@ from question_generator import QuestionGenerator
 from answer_evaluator import AnswerEvaluator, LIKERT_SCALE
 import mcq_irt.rasch_engine as irt
 
-# ── MCQ imports ───────────────────────────────────────────────────────────────
-import mcq_irt.mcq_database as db
+# ── LLM MCQ Practice import ───────────────────────────────────────────────────
+import mcq_practice_llm as pllm
 
-# ── Database imports (unified interview_coach DB) ──────────────────────────────
+# ── Test imports ──────────────────────────────────────────────────────────────
+import test_database as test_db
+
+# ── Database imports (unified interview_coach DB) ─────────────────────────────
 import open_ended_database as oe_db
 import final_database as final_db
 
@@ -41,23 +45,22 @@ st.set_page_config(
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MCQ AUTO-SETUP (runs once — loads question bank if empty)
+# TEST AUTO-SETUP (runs once — loads test question bank if empty)
 # ─────────────────────────────────────────────────────────────────────────────
 
-MCQ_DATA_PATH       = "mcq_irt/mcq_data.json"
-QUESTIONS_PER_SKILL = 3
+TEST_DATA_PATH = "test_data.json"
 
-def _mcq_auto_setup():
-    db.init_db()
-    skills = db.get_skills()
-    if not skills:
-        n, err = db.load_questions_from_json(MCQ_DATA_PATH)
+def _test_auto_setup():
+    test_db.init_db()
+    questions = test_db.get_test_questions()
+    if not questions:
+        n, err = test_db.load_test_questions_from_json(TEST_DATA_PATH)
         if err:
-            print(f"[MCQ Setup] Failed to load: {err}")
+            print(f"[Test Setup] Failed: {err}")
         else:
-            print(f"[MCQ Setup] Loaded {n} questions from {MCQ_DATA_PATH}")
+            print(f"[Test Setup] Loaded {n} test questions")
 
-_mcq_auto_setup()
+_test_auto_setup()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # GLOBAL CSS
@@ -81,17 +84,6 @@ section[data-testid="stSidebar"] .stButton button {
     display: flex; gap: 10px; margin-bottom: 1.6rem;
     background: white; border-radius: 14px; padding: 8px;
     box-shadow: 0 1px 3px rgba(0,0,0,0.06), 0 4px 16px rgba(79,70,229,0.07);
-}
-.mode-btn-active {
-    flex: 1; text-align: center; padding: 12px 20px; border-radius: 10px;
-    background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
-    color: white !important; font-weight: 700; font-size: 0.95rem;
-    cursor: default;
-}
-.mode-btn-inactive {
-    flex: 1; text-align: center; padding: 12px 20px; border-radius: 10px;
-    background: #f1f5f9; color: #64748b !important; font-weight: 600;
-    font-size: 0.95rem; cursor: pointer;
 }
 
 /* ── Shared cards ── */
@@ -230,16 +222,7 @@ section[data-testid="stSidebar"] .stButton button {
 .calibration-under      { background: #eff6ff; border: 1.5px solid #93c5fd; color: #1d4ed8; }
 .calibration-default    { background: #f8fafc; border: 1.5px solid #e2e8f0; color: #475569; }
 
-/* ── MCQ styles ── */
-.skill-tab-active  { background: #4f46e5; color: white; border-radius: 8px;
-    padding: 6px 16px; font-weight: 700; font-size: 0.82rem; display:inline-block; }
-.skill-tab-done    { background: #dcfce7; color: #15803d; border-radius: 8px;
-    padding: 6px 16px; font-weight: 700; font-size: 0.82rem; display:inline-block; }
-.skill-tab-pending { background: #f1f5f9; color: #64748b; border-radius: 8px;
-    padding: 6px 16px; font-weight: 600; font-size: 0.82rem; display:inline-block; }
-.prof-pill {
-    display: inline-block; border-radius: 99px;
-    padding: 4px 18px; font-weight: 700; font-size: 0.82rem; }
+/* ── Test leaderboard ── */
 .lb-row { display: flex; align-items: center; gap: 14px;
     padding: 0.8rem 1.2rem; border-radius: 12px;
     background: white; border: 1px solid #e0e7ff; margin-bottom: 6px; }
@@ -251,10 +234,6 @@ section[data-testid="stSidebar"] .stButton button {
 .lb-score { font-family: 'DM Mono', monospace; color: #4f46e5; font-weight: 600; }
 .lb-you   { background: #eef2ff; color: #4f46e5; border-radius: 4px;
     padding: 2px 8px; font-size: 0.7rem; font-weight: 700; margin-left: 6px; }
-.expl-box { background: #eef2ff; border: 1px solid #c7d2fe; border-radius: 10px;
-    padding: 0.8rem 1rem; font-size: 0.87rem; color: #3730a3; margin-top: 0.6rem; }
-.theta-display { font-family: 'DM Mono', monospace; font-size: 0.78rem;
-    color: #64748b; margin-top: 4px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -270,9 +249,9 @@ def load_interview_tools():
 # SESSION STATE DEFAULTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Shared
+# Shared — three modes
 if "app_mode" not in st.session_state:
-    st.session_state.app_mode = "interview"   # "interview" | "mcq"
+    st.session_state.app_mode = "interview"   # "interview" | "mcq" | "test"
 
 # ── AI Interview defaults ─────────────────────────────────────────────────────
 _interview_defaults = {
@@ -292,25 +271,20 @@ for k, v in _interview_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
-# ── MCQ defaults ──────────────────────────────────────────────────────────────
-_mcq_defaults = {
-    "mcq_stage":           "home",
-    "student_name":        "",
-    "student_email":       "",
-    "session_id":          None,
-    "skills":              [],
-    "skill_pools":         {},
-    "skill_index":         0,
-    "skill_thetas":        {},
-    "skill_responses":     {},
-    "skill_asked":         {},
-    "skill_last_correct":  {},
-    "skill_profiles":      {},
-    "q_count":             0,
-    "current_q":           None,
-    "questions_per_skill": 15,
+# ── Shared profile defaults ───────────────────────────────────────────────────
+if "student_name"  not in st.session_state: st.session_state.student_name  = ""
+if "student_email" not in st.session_state: st.session_state.student_email = ""
+
+# ── Test defaults ─────────────────────────────────────────────────────────────
+_test_defaults = {
+    "test_stage":       "home",
+    "test_session_id":  None,
+    "test_questions":   [],
+    "test_answers":     {},
+    "test_q_index":     0,
+    "test_submitted":   False,
 }
-for k, v in _mcq_defaults.items():
+for k, v in _test_defaults.items():
     if k not in st.session_state:
         st.session_state[k] = v
 
@@ -373,64 +347,6 @@ def interview_progress_bar(current, total):
         <div class="progress-bar-fill" style="width:{pct}%"></div>
     </div>""", unsafe_allow_html=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HELPERS — MCQ
-# ─────────────────────────────────────────────────────────────────────────────
-
-PROF_COLORS = {
-    "Expert":       ("#534AB7", "#ede9fe"),
-    "Advanced":     ("#1D9E75", "#dcfce7"),
-    "Intermediate": ("#378ADD", "#dbeafe"),
-    "Beginner":     ("#d97706", "#fef3c7"),
-    "Novice":       ("#dc2626", "#fee2e2"),
-}
-MEDALS  = {1: "🥇", 2: "🥈", 3: "🥉"}
-ROW_CLS = {1: "gold", 2: "silver", 3: "bronze"}
-
-def prof_pill(label: str) -> str:
-    color, bg = PROF_COLORS.get(label, ("#64748b", "#f1f5f9"))
-    return (f'<span class="prof-pill" style="background:{bg};color:{color}">{label}</span>')
-
-def render_lb_rows(rows: list, current_sid: str = None):
-    st.markdown('<div>', unsafe_allow_html=True)
-    for r in rows:
-        rank    = int(r.get("overall_rank") or r.get("skill_rank") or 1)
-        medal   = MEDALS.get(rank, "")
-        row_cls = ROW_CLS.get(rank, "")
-        is_me   = current_sid and str(r.get("session_id","")) == current_sid
-        theta   = float(r.get("theta_final") or r.get("theta_overall") or 0)
-        prof    = r.get("proficiency_label", "")
-        name    = html_module.escape(str(r.get("student_name","")))
-        you     = '<span class="lb-you">you</span>' if is_me else ""
-        correct = r.get("questions_correct", r.get("total_correct", 0))
-        total   = r.get("questions_answered", r.get("total_answered", 0))
-        color, bg = PROF_COLORS.get(prof, ("#64748b","#f1f5f9"))
-        me_cls  = " is-me" if is_me else ""
-        st.markdown(f"""
-        <div class="lb-row {row_cls}{me_cls}">
-            <div style="font-size:1.2rem;min-width:28px">{medal}</div>
-            <div style="font-family:'DM Mono',monospace;font-size:0.78rem;
-                        color:#94a3b8;min-width:26px">#{rank}</div>
-            <div style="flex:1">
-                <div class="lb-name">{name}{you}</div>
-                <div class="theta-display">θ = {theta:+.3f}</div>
-            </div>
-            <div style="text-align:right">
-                <span class="prof-pill" style="background:{bg};color:{color}">{prof}</span>
-                <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">
-                    {correct}/{total} correct</div>
-            </div>
-        </div>""", unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-def reset_mcq_session():
-    dynamic_keys = [k for k in st.session_state if k.startswith("skill_session_")]
-    for k in dynamic_keys:
-        del st.session_state[k]
-    for k, v in _mcq_defaults.items():
-        st.session_state[k] = v
-
-
 def require_profile() -> bool:
     if not st.session_state.student_name or not st.session_state.student_email:
         st.warning("Please enter your name and email in the sidebar before continuing.")
@@ -455,25 +371,26 @@ with st.sidebar:
                 unsafe_allow_html=True)
     if st.session_state.student_name and st.session_state.student_email:
         st.markdown(f"**{st.session_state.student_name}**")
-        st.markdown(f"<span style='font-size:0.85rem;color:#c7d2fe'>{st.session_state.student_email}</span>", unsafe_allow_html=True)
+        st.markdown(f"<span style='font-size:0.85rem;color:#c7d2fe'>{st.session_state.student_email}</span>",
+                    unsafe_allow_html=True)
         if st.button("Edit Profile", use_container_width=True):
-            st.session_state.student_name = ""
+            st.session_state.student_name  = ""
             st.session_state.student_email = ""
             st.experimental_rerun()
     else:
-        name = st.text_input("Full Name", value=st.session_state.get("sidebar_name", ""), key="sidebar_name")
-        email = st.text_input("Email", value=st.session_state.get("sidebar_email", ""), key="sidebar_email")
+        name  = st.text_input("Full Name",  value=st.session_state.get("sidebar_name", ""),  key="sidebar_name")
+        email = st.text_input("Email",      value=st.session_state.get("sidebar_email", ""), key="sidebar_email")
         if st.button("Save Profile", use_container_width=True):
             if not name.strip() or "@" not in email:
                 st.warning("Enter a valid name and email to continue.")
             else:
-                st.session_state.student_name = name.strip()
+                st.session_state.student_name  = name.strip()
                 st.session_state.student_email = email.strip()
                 st.success("Profile saved. Select a mode to continue.")
 
     st.markdown("<hr style='border-color:#312e81;margin:1rem 0'>", unsafe_allow_html=True)
-    
-    # ── Mode switcher in sidebar ──────────────────────────────────────────
+
+    # ── Mode switcher in sidebar ──────────────────────────────────────────────
     st.markdown("<div style='margin-bottom:0.5rem;font-size:0.72rem;font-weight:700;"
                 "letter-spacing:0.1em;text-transform:uppercase;color:#a5b4fc'>Mode</div>",
                 unsafe_allow_html=True)
@@ -486,7 +403,7 @@ with st.sidebar:
             st.session_state.app_mode = "interview"
             st.rerun()
     with col_b:
-        if st.button("🎯 MCQ Quiz",
+        if st.button("🧠 AI Practice",
                      use_container_width=True,
                      type="primary" if st.session_state.app_mode == "mcq" else "secondary"):
             st.session_state.app_mode = "mcq"
@@ -494,7 +411,17 @@ with st.sidebar:
 
     st.markdown("<hr style='border-color:#312e81;margin:1rem 0'>", unsafe_allow_html=True)
 
-    # ── Mode-specific sidebar content ──────────────────────────────────────
+    # ── Common: Switch Student ─────────────────────────────────────────────────
+    if st.session_state.get("student_name", ""):
+        st.markdown(f"**👤 {st.session_state.student_name}**")
+        if st.button("🔄 Switch Student", use_container_width=True):
+            st.session_state.student_name  = ""
+            st.session_state.student_email = ""
+            pllm._reset()
+            st.rerun()
+        st.markdown("<hr style='border-color:#312e81;margin:1rem 0'>", unsafe_allow_html=True)
+
+    # ── Mode-specific sidebar content ─────────────────────────────────────────
     if st.session_state.app_mode == "interview":
         steps = [("upload","1","Upload Resume"),("configure","2","Configure"),
                  ("interview","3","Interview"),("results","4","Results")]
@@ -541,37 +468,32 @@ with st.sidebar:
                 st.session_state[k] = v
             st.rerun()
 
-    else:  # MCQ sidebar
-        for label, stage in [("🏠 Home","home"),("🏆 Leaderboard","leaderboard")]:
-            if st.button(label, use_container_width=True):
-                st.session_state.mcq_stage = stage
-                st.rerun()
-        st.markdown("<hr style='border-color:#312e81;margin:1rem 0'>", unsafe_allow_html=True)
-        ok, msg = db.test_connection()
-        if ok:
-            st.success("🟢 DB connected")
-        else:
-            st.error(f"🔴 DB error\n{msg[:60]}")
-        if st.session_state.get("student_name", ""):
-            st.markdown(f"**👤 {st.session_state.student_name}**")
-            if st.button("🔄 Switch Student", use_container_width=True):
-                reset_mcq_session()
+    elif st.session_state.app_mode == "mcq":
+        # Quick reset for LLM practice
+        if st.session_state.get("pllm_stage", "home") != "home":
+            if st.button("↺ New Practice Session", use_container_width=True):
+                pllm._reset()
                 st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN CONTENT — MODE SWITCHER BANNER
+# MAIN CONTENT — THREE-BUTTON MODE SWITCHER
 # ─────────────────────────────────────────────────────────────────────────────
 
 mode = st.session_state.app_mode
 
-ai_active   = "mode-btn-active"   if mode == "interview" else "mode-btn-inactive"
-mcq_active  = "mode-btn-active"   if mode == "mcq"       else "mode-btn-inactive"
-
-st.markdown(f"""
-<div class="mode-switcher">
-    <div class="{ai_active}">🎤 AI Interview Coach</div>
-    <div class="{mcq_active}">🎯 Adaptive MCQ Quiz</div>
-</div>""", unsafe_allow_html=True)
+col1, col2, col3 = st.columns(3)
+with col1:
+    if st.button("🎤 AI Interview", use_container_width=True,
+                 type="primary" if mode == "interview" else "secondary"):
+        st.session_state.app_mode = "interview"; st.rerun()
+with col2:
+    if st.button("🧠 AI MCQ Practice", use_container_width=True,
+                 type="primary" if mode == "mcq" else "secondary"):
+        st.session_state.app_mode = "mcq"; st.rerun()
+with col3:
+    if st.button("🏆 MCQ Test", use_container_width=True,
+                 type="primary" if mode == "test" else "secondary"):
+        st.session_state.app_mode = "test"; st.rerun()
 
 # ═════════════════════════════════════════════════════════════════════════════
 #  AI INTERVIEW MODE
@@ -727,15 +649,25 @@ if mode == "interview":
                     if gen_error:
                         st.error(f"❌ Question generation failed:\n\n{gen_error}")
                     elif questions:
+                        for q in questions:
+                            if not q.get("question_id"):
+                                q["question_id"] = f"q_{q.get('id', abs(hash(q.get('question', ''))))}"
+                            if "b_param" not in q:
+                                q["b_param"] = 0.0
+
                         cat_pool = {}
                         for q in questions:
                             cat = q.get("category", "Other")
                             cat_pool.setdefault(cat, []).append(q)
 
-                        oe_session_id = None
+                        oe_session_id   = None
                         oe_question_map = {}
                         try:
-                            skills_tested = [skill["name"] for category, skills_list in skills_data.get("categories", {}).items() for skill in skills_list]
+                            skills_tested = [
+                                skill["name"]
+                                for category, skills_list in skills_data.get("categories", {}).items()
+                                for skill in skills_list
+                            ]
                             oe_session_id = oe_db.create_oe_session(
                                 st.session_state.student_name,
                                 st.session_state.student_email,
@@ -744,7 +676,7 @@ if mode == "interview":
                             )
                             if oe_session_id:
                                 stored_questions = oe_db.store_oe_questions(oe_session_id, questions)
-                                oe_question_map = {
+                                oe_question_map  = {
                                     item["question_id"]: item["session_question_id"]
                                     for item in stored_questions
                                     if item.get("question_id")
@@ -752,22 +684,19 @@ if mode == "interview":
                         except Exception as e:
                             st.warning(f"⚠️ Open-ended session persistence failed: {e}")
 
-                        st.session_state.questions        = questions
-                        st.session_state.q_index          = 0
-                        st.session_state.answers          = {}
-                        st.session_state.evaluations      = {}
-                        st.session_state.cat_pool         = cat_pool
-                        st.session_state.category_thetas  = {
-                            cat: irt.THETA_INIT for cat in cat_pool}
-                        st.session_state.category_asked   = {
-                            cat: set() for cat in cat_pool}
-                        st.session_state.category_responses = {
-                            cat: [] for cat in cat_pool}
-                        st.session_state.answers_per_skill = answers_per_skill
-                        st.session_state.stage            = "interview"
-                        st.session_state.oe_session_id    = oe_session_id
-                        st.session_state.oe_question_map  = oe_question_map
-                        st.session_state.oe_completed     = False
+                        st.session_state.questions          = questions
+                        st.session_state.q_index            = 0
+                        st.session_state.answers            = {}
+                        st.session_state.evaluations        = {}
+                        st.session_state.cat_pool           = cat_pool
+                        st.session_state.category_thetas    = {cat: irt.THETA_INIT for cat in cat_pool}
+                        st.session_state.category_asked     = {cat: set() for cat in cat_pool}
+                        st.session_state.category_responses = {cat: [] for cat in cat_pool}
+                        st.session_state.answers_per_skill  = answers_per_skill
+                        st.session_state.stage              = "interview"
+                        st.session_state.oe_session_id      = oe_session_id
+                        st.session_state.oe_question_map    = oe_question_map
+                        st.session_state.oe_completed       = False
                         st.rerun()
                     else:
                         st.error("❌ No questions were generated.")
@@ -892,13 +821,13 @@ if mode == "interview":
                     st.session_state.evaluations[q_uid] = result
 
                     try:
-                        oe_session_id = st.session_state.get("oe_session_id")
+                        oe_session_id   = st.session_state.get("oe_session_id")
                         oe_question_map = st.session_state.get("oe_question_map", {})
                         if oe_session_id and q.get("question_id"):
                             session_question_id = oe_question_map.get(q["question_id"])
                             if session_question_id:
                                 confidence = int(result.get("likert", 0))
-                                feedback = result.get("detailed_feedback", "")
+                                feedback   = result.get("detailed_feedback", "")
                                 oe_db.save_oe_response(
                                     session_id=oe_session_id,
                                     session_question_id=session_question_id,
@@ -912,9 +841,9 @@ if mode == "interview":
                     except Exception as e:
                         print(f"[OE DB] save response failed: {e}")
 
-                    cat        = current_cat or q.get("category", "Other")
-                    b_param    = float(q.get("b_param", 0.0))
-                    score      = result.get("total_score", 0)
+                    cat          = current_cat or q.get("category", "Other")
+                    b_param      = float(q.get("b_param", 0.0))
+                    score        = result.get("total_score", 0)
                     frac_correct = score / 100.0
 
                     if cat in st.session_state.get("category_thetas", {}):
@@ -1046,18 +975,18 @@ if mode == "interview":
         if not evaluations:
             st.info("No answers evaluated yet."); st.stop()
 
-        ev_list   = list(evaluations.values())
+        ev_list    = list(evaluations.values())
         q_uid_to_q = {q.get("question_id", str(i)): q for i, q in enumerate(questions)}
-        q_list    = [q_uid_to_q.get(uid, {}) for uid in evaluations.keys()]
-        summary   = answer_eval.compute_session_summary(ev_list, q_list)
+        q_list     = [q_uid_to_q.get(uid, {}) for uid in evaluations.keys()]
+        summary    = answer_eval.compute_session_summary(ev_list, q_list)
 
         if not st.session_state.get("oe_completed") and st.session_state.get("oe_session_id"):
             try:
                 oe_session_id = st.session_state.oe_session_id
-                total = len(st.session_state.questions)
-                answered = len(evaluations)
-                avg = summary["average_score"]
-                grade = summary["overall_grade"]
+                total         = len(st.session_state.questions)
+                answered      = len(evaluations)
+                avg           = summary["average_score"]
+                grade         = summary["overall_grade"]
                 oe_db.update_oe_session_stats(
                     session_id=oe_session_id,
                     total_questions=total,
@@ -1257,195 +1186,95 @@ if mode == "interview":
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  MCQ MODE
+#  LLM MCQ PRACTICE MODE  (replaces IRT-based MCQ)
 # ═════════════════════════════════════════════════════════════════════════════
 
 elif mode == "mcq":
+    if not require_profile():
+        st.stop()
+    pllm.render_llm_mcq_practice()
 
-    mcq_stage = st.session_state.mcq_stage
 
-    # ── MCQ HOME ──────────────────────────────────────────────────────────────
-    if mcq_stage == "home":
+# ═════════════════════════════════════════════════════════════════════════════
+#  MCQ TEST MODE
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif mode == "test":
+
+    if not require_profile():
+        st.stop()
+
+    test_stage = st.session_state.test_stage
+
+    # ── TEST HOME ─────────────────────────────────────────────────────────────
+    if test_stage == "home":
         st.markdown("""
         <div class="page-banner-mcq">
-            <h1>🎯 Adaptive MCQ Assessment</h1>
-            <p>Questions adapt to your ability · Rasch IRT scoring · Skill-wise leaderboard</p>
+            <h1>🏆 MCQ Test — 10 Questions</h1>
+            <p>Same questions for everyone · 2 per skill · Ranked by score · One attempt</p>
         </div>""", unsafe_allow_html=True)
 
-        skills_available = db.get_skills()
-        if not skills_available:
-            st.warning("⚠️ No questions loaded. Check that mcq_data.json is present and DB is connected.")
+        questions = test_db.get_test_questions()
+        if not questions:
+            st.error("Test questions not loaded. Check test_data.json and DB connection.")
             st.stop()
 
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-label">Register to Start</div>', unsafe_allow_html=True)
-        if not st.session_state.student_name or not st.session_state.student_email:
-            st.info("Please save your profile in the sidebar first.")
-            name = st.text_input("Full Name *", value=st.session_state.student_name, placeholder="e.g. Priya S")
-            email = st.text_input("Email *", value=st.session_state.student_email, placeholder="e.g. priya@email.com")
-        else:
-            name = st.session_state.student_name
-            email = st.session_state.student_email
-            st.markdown(f"<div style='margin-bottom:0.75rem'><strong>{html_module.escape(name)}</strong><br><span style='color:#64748b'>{html_module.escape(email)}</span></div>", unsafe_allow_html=True)
-
-        max_qs = min(15, min(len(db.get_questions_for_skill(sk)) for sk in skills_available))
-        if max_qs > 7:
-            st.markdown("**Number of questions per skill:**")
-            q_per_skill = st.slider(
-                "Questions per skill", min_value=7, max_value=max_qs, value=7, step=1,
-                help="Fewer = faster but less accurate θ estimate.")
-        else:
-            q_per_skill = max_qs
-
-        total_qs = len(skills_available) * q_per_skill
-        col1, col2, col3 = st.columns(3)
-        col1.metric("📚 Skills", len(skills_available))
-        col2.metric("❓ Per skill", q_per_skill)
-        col3.metric("📋 Total", total_qs)
-
-        st.markdown("**Skills you will be assessed on:**")
-        cols = st.columns(len(skills_available))
-        for col, sk in zip(cols, skills_available):
-            col.markdown(f'<div style="background:#eef2ff;border-radius:8px;padding:8px 12px;'
-                         f'text-align:center;font-weight:700;color:#4f46e5;font-size:0.85rem">'
-                         f'{sk}</div>', unsafe_allow_html=True)
-
-        with st.expander("📖 How it works"):
-            st.markdown(f"""
-- Answer **{q_per_skill} questions per skill** ({len(skills_available)} skills · {total_qs} total)
-- Questions **adapt to your ability** — get one right and the next is harder
-- Scored using **Rasch IRT** — harder correct answers count more
-- Ranked against all other students skill-by-skill
-            """)
-
-        email_ok = bool(email.strip() and "@" in email and "." in email.split("@")[-1])
-        agreed   = st.checkbox("I understand the assessment rules")
+        skills_in_test = ["DSA", "OOPs", "Python", "SQL", "DevOps"]
+        cols = st.columns(5)
+        for col, sk in zip(cols, skills_in_test):
+            col.markdown(
+                f'<div style="background:#eef2ff;border-radius:8px;padding:8px;'
+                f'text-align:center;font-weight:700;color:#4f46e5;font-size:0.82rem">'
+                f'{sk}<br><span style="font-size:0.7rem;font-weight:400;color:#6366f1">2 Qs</span>'
+                f'</div>', unsafe_allow_html=True)
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("""
+        **Rules:**
+        - 10 questions, one screen at a time
+        - All students get the same questions in the same order
+        - Ranked by number correct (ties broken by completion time)
+        - You cannot go back once you move to the next question
+        """)
+        agreed = st.checkbox("I understand the rules")
         st.markdown('</div>', unsafe_allow_html=True)
 
-        if st.button("🚀 Start Assessment", type="primary", use_container_width=True,
-                     disabled=not (name.strip() and email_ok and agreed)):
-            pools = {sk: db.get_questions_for_skill(sk) for sk in skills_available}
-            empty = [sk for sk, qs in pools.items() if not qs]
-            if empty:
-                st.error(f"No questions found for: {', '.join(empty)}"); st.stop()
-
-            sid = db.create_session(name.strip(), email.strip(), skills_available)
+        if st.button("Start Test →", type="primary", use_container_width=True,
+                     disabled=not agreed):
+            sid = test_db.create_test_session(
+                st.session_state.student_name,
+                st.session_state.student_email)
             if not sid:
-                st.error("Failed to create session. Check DB connection."); st.stop()
-
-            st.session_state.student_name        = name.strip()
-            st.session_state.student_email       = email.strip()
-            st.session_state.session_id          = sid
-            st.session_state.skills              = skills_available
-            st.session_state.skill_pools         = pools
-            st.session_state.skill_index         = 0
-            st.session_state.skill_thetas        = {sk: irt.THETA_INIT for sk in skills_available}
-            st.session_state.skill_responses     = {sk: [] for sk in skills_available}
-            st.session_state.skill_asked         = {sk: set() for sk in skills_available}
-            st.session_state.skill_last_correct  = {sk: None for sk in skills_available}
-            st.session_state.skill_profiles      = {}
-            st.session_state.q_count             = 0
-            st.session_state.current_q           = None
-            st.session_state.questions_per_skill = q_per_skill
-            st.session_state.mcq_stage           = "quiz"
+                st.error("Failed to create session. Check DB."); st.stop()
+            st.session_state.test_session_id = sid
+            st.session_state.test_questions  = questions
+            st.session_state.test_answers    = {}
+            st.session_state.test_q_index    = 0
+            st.session_state.test_submitted  = False
+            st.session_state.test_stage      = "quiz"
             st.rerun()
 
-    # ── MCQ QUIZ ──────────────────────────────────────────────────────────────
-    elif mcq_stage == "quiz":
-        skills    = st.session_state.skills
-        skill_idx = st.session_state.skill_index
+    # ── TEST QUIZ ─────────────────────────────────────────────────────────────
+    elif test_stage == "quiz":
+        questions = st.session_state.test_questions
+        q_index   = st.session_state.test_q_index
+        total_qs  = len(questions)
 
-        if skill_idx >= len(skills):
-            st.session_state.mcq_stage = "results"; st.rerun()
+        if q_index >= total_qs:
+            st.session_state.test_stage = "results"; st.rerun()
 
-        current_skill = skills[skill_idx]
-        pool    = st.session_state.skill_pools[current_skill]
-        q_count = st.session_state.q_count
+        q   = questions[q_index]
+        pct = int((q_index / total_qs) * 100)
 
-        sess_key = f"skill_session_{current_skill}"
-        if sess_key not in st.session_state:
-            st.session_state[sess_key] = irt.SkillSession(
-                current_skill, st.session_state.get("questions_per_skill", QUESTIONS_PER_SKILL))
-        skill_sess = st.session_state[sess_key]
+        st.markdown(f"""
+        <div class="page-banner-mcq">
+            <h1>MCQ Test</h1>
+            <p>Question {q_index+1} of {total_qs} · {q['skill']}</p>
+        </div>""", unsafe_allow_html=True)
 
-        theta = skill_sess.theta
-        prof  = skill_sess.proficiency
-
-        tabs_html = ""
-        for i, sk in enumerate(skills):
-            if i < skill_idx:
-                tabs_html += f'<span class="skill-tab-done">✓ {sk}</span> '
-            elif i == skill_idx:
-                tabs_html += f'<span class="skill-tab-active">▶ {sk}</span> '
-            else:
-                tabs_html += f'<span class="skill-tab-pending">{sk}</span> '
-        st.markdown(f'<div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:1rem">'
-                    f'{tabs_html}</div>', unsafe_allow_html=True)
-
-        qps = st.session_state.get("questions_per_skill", QUESTIONS_PER_SKILL)
-        pct = int((q_count / qps) * 100)
-        st.markdown(
-            f"**{current_skill}** · Q {q_count+1}/{qps} · "
-            f"θ = {theta:+.3f} · {prof['label']}")
         st.markdown(
             f'<div class="prog-wrap"><div class="prog-fill" style="width:{pct}%"></div></div>',
             unsafe_allow_html=True)
-
-        if skill_sess.done:
-            summary = skill_sess.summary()
-            db.save_skill_profile(
-                session_id=st.session_state.session_id,
-                student_name=st.session_state.student_name,
-                student_email=st.session_state.student_email,
-                skill=current_skill,
-                theta_final=summary["theta_final"],
-                proficiency_score=summary["proficiency_score"],
-                proficiency_label=summary["proficiency_label"],
-                questions_answered=summary["questions_answered"],
-                questions_correct=summary["questions_correct"],
-            )
-            st.session_state.skill_profiles[current_skill] = {
-                "theta":       summary["theta_final"],
-                "proficiency": irt.theta_to_proficiency(summary["theta_final"]),
-                "answered":    summary["questions_answered"],
-                "correct":     summary["questions_correct"],
-                "se":          summary["theta_se"],
-            }
-            st.session_state.skill_thetas[current_skill] = summary["theta_final"]
-            st.session_state.skill_index += 1
-            st.session_state.q_count      = 0
-            st.session_state.current_q    = None
-
-            if st.session_state.skill_index >= len(skills):
-                skill_thetas  = st.session_state.skill_thetas
-                overall_theta = irt.compute_overall_theta(skill_thetas)
-                overall_prof  = irt.theta_to_proficiency(overall_theta)
-                total_ans = sum(p["answered"] for p in st.session_state.skill_profiles.values())
-                total_cor = sum(p["correct"]  for p in st.session_state.skill_profiles.values())
-                db.complete_session(
-                    session_id=st.session_state.session_id,
-                    theta_overall=overall_theta,
-                    proficiency_label=overall_prof["label"],
-                    proficiency_score=overall_prof["score"],
-                    total_answered=total_ans,
-                    total_correct=total_cor,
-                )
-                st.session_state.mcq_stage = "results"
-            st.rerun()
-
-        if st.session_state.current_q is None:
-            q = skill_sess.next_question(pool)
-            if q is None:
-                skill_sess.quiz_length = len(skill_sess.responses); st.rerun()
-            st.session_state.current_q = q
-
-        q = st.session_state.current_q
-        if q is None:
-            st.rerun()
-
-        diff_colors = {"easy": "#16a34a", "medium": "#d97706", "hard": "#dc2626"}
-        diff        = q.get("difficulty_tier", "medium")
-        diff_color  = diff_colors.get(diff, "#6366f1")
 
         st.markdown(f"""
         <div style="background:white;border-radius:14px;padding:1.6rem 2rem;
@@ -1453,10 +1282,7 @@ elif mode == "mcq":
                     box-shadow:0 2px 12px rgba(79,70,229,0.08)">
             <div style="font-size:0.72rem;font-weight:600;color:#6366f1;
                         letter-spacing:0.1em;text-transform:uppercase;margin-bottom:0.5rem">
-                Question {q_count+1} of {qps} &nbsp;·&nbsp;
-                <span style="color:{diff_color}">{diff.upper()}</span>
-                &nbsp;·&nbsp; b = {q['b_param']:+.2f}
-                &nbsp;·&nbsp; θ = {theta:+.3f}
+                Q{q_index+1} · {q['skill']}
             </div>
             <div style="font-size:1.05rem;font-weight:600;color:#1e1b4b;line-height:1.6">
                 {html_module.escape(q['question_text'])}
@@ -1472,170 +1298,184 @@ elif mode == "mcq":
             options=list(option_map.keys()),
             format_func=lambda k: f"{k.upper()}.  {option_map[k]}",
             index=None,
-            key=f"radio_{q['question_id']}",
+            key=f"test_radio_{q['question_id']}",
             label_visibility="collapsed",
         )
 
-        if st.button("Submit Answer →", type="primary",
+        is_last   = (q_index == total_qs - 1)
+        btn_label = "Submit Test →" if is_last else "Next Question →"
+
+        if st.button(btn_label, type="primary",
                      use_container_width=True, disabled=choice is None):
-            rec = skill_sess.record_answer(q, choice)
-            db_err = db.save_response(
-                session_id=st.session_state.session_id,
-                question_id=rec["question_id"],
-                skill=current_skill,
-                selected_option=rec["selected_option"],
-                is_correct=rec["is_correct"],
-                b_used=rec["b_used"],
-                theta_before=rec["theta_before"],
-                theta_after=rec["theta_after"],
-                p_correct_irt=rec["p_correct_irt"],
-                surprise=rec["surprise"],
-                proficiency_before=rec["proficiency_before"],
-                proficiency_after=rec["proficiency_after"],
+            is_correct = (choice == q["correct_option"])
+            st.session_state.test_answers[q["question_id"]] = {
+                "selected":    choice,
+                "correct":     q["correct_option"],
+                "is_correct":  is_correct,
+                "skill":       q["skill"],
+                "explanation": q.get("explanation", ""),
+                "question_text": q["question_text"],
+                "options":     option_map,
+            }
+            test_db.save_test_response(
+                session_id=st.session_state.test_session_id,
+                question_id=q["question_id"],
+                skill=q["skill"],
+                selected_option=choice,
+                is_correct=is_correct,
             )
-            if db_err:
-                st.warning(f"⚠️ DB save error: {db_err}")
-            db.update_question_b(rec["question_id"], rec["b_final"],
-                                 rec["is_correct"], rec["b_source"])
-
-            st.session_state.skill_thetas[current_skill] = skill_sess.theta
-            st.session_state.q_count  += 1
-            st.session_state.current_q = None
-
-            dtheta = rec["theta_after"] - rec["theta_before"]
-            if rec["is_correct"]:
-                st.success("✅ Correct!")
+            if is_last:
+                answers       = st.session_state.test_answers
+                total_correct = sum(1 for a in answers.values() if a["is_correct"])
+                test_db.complete_test_session(
+                    session_id=st.session_state.test_session_id,
+                    total_correct=total_correct,
+                    total_score=total_correct * 10,
+                )
+                st.session_state.test_stage = "results"
             else:
-                co       = rec["correct_option"]
-                opt_text = q.get(f"option_{co}", co.upper())
-                st.error(f"❌ Wrong. Correct answer: **{co.upper()}. {opt_text}**")
+                st.session_state.test_q_index += 1
+            st.rerun()
 
-            col_s1, col_s2, col_s3 = st.columns(3)
-            col_s1.metric("P(correct) predicted", f"{rec['p_correct_irt']:.1%}")
-            col_s2.metric("Surprise (y−P)",        f"{rec['surprise']:+.3f}")
-            col_s3.metric("θ change",
-                          f"{rec['theta_after']:+.3f}", f"{dtheta:+.3f}")
-            if rec.get("explanation"):
-                st.markdown(
-                    f'<div class="expl-box">💡 {html_module.escape(rec["explanation"])}</div>',
-                    unsafe_allow_html=True)
-            st.button("Next Question →", on_click=st.rerun)
+    # ── TEST RESULTS ──────────────────────────────────────────────────────────
+    elif test_stage == "results":
+        answers       = st.session_state.test_answers
+        total_correct = sum(1 for a in answers.values() if a["is_correct"])
+        total_qs      = len(st.session_state.test_questions)
+        score_pct     = round(total_correct / total_qs * 100) if total_qs else 0
 
-    # ── MCQ RESULTS ───────────────────────────────────────────────────────────
-    elif mcq_stage == "results":
-        profiles = st.session_state.skill_profiles
-        if not profiles:
-            db_profiles = db.get_session_skill_profiles(st.session_state.session_id)
-            profiles    = {p["skill"]: {
-                "theta":       p["theta_final"],
-                "proficiency": irt.theta_to_proficiency(p["theta_final"]),
-                "answered":    p["questions_answered"],
-                "correct":     p["questions_correct"],
-            } for p in db_profiles}
-
-        skill_thetas  = {sk: p["theta"] for sk, p in profiles.items()}
-        overall_theta = irt.compute_overall_theta(skill_thetas)
-        overall_prof  = irt.theta_to_proficiency(overall_theta)
-        oc, obg       = PROF_COLORS.get(overall_prof["label"], ("#4f46e5","#eef2ff"))
+        score_color = "#16a34a" if score_pct >= 70 else ("#d97706" if score_pct >= 50 else "#dc2626")
+        grade_label = "Excellent" if score_pct >= 80 else ("Good" if score_pct >= 60 else ("Average" if score_pct >= 40 else "Needs Work"))
 
         st.markdown(f"""
         <div class="page-banner-mcq">
-            <div style="font-size:0.75rem;letter-spacing:0.12em;opacity:0.7;margin-bottom:0.4rem">
-                ASSESSMENT COMPLETE
-            </div>
-            <h1>{st.session_state.student_name}</h1>
+            <h1>Test Complete!</h1>
             <div style="display:inline-flex;align-items:center;gap:12px;
                         background:rgba(255,255,255,0.12);border-radius:999px;
                         padding:8px 20px;margin-top:0.6rem">
-                <span style="font-size:2rem;font-weight:800">θ = {overall_theta:+.3f}</span>
-                <span style="background:{obg};color:{oc};border-radius:999px;
-                             padding:4px 16px;font-weight:700;font-size:0.9rem">
-                    {overall_prof['label']}
-                </span>
+                <span style="font-size:2rem;font-weight:800">{total_correct}/{total_qs}</span>
+                <span style="font-size:1rem;opacity:0.85">correct · {score_pct}%</span>
             </div>
         </div>""", unsafe_allow_html=True)
 
-        st.markdown('<div class="section-label">Per-Skill Proficiency</div>', unsafe_allow_html=True)
-        cols = st.columns(len(profiles))
-        for col, (skill, p) in zip(cols, profiles.items()):
-            prof      = p["proficiency"]
-            color, bg = PROF_COLORS.get(prof["label"], ("#4f46e5","#eef2ff"))
-            acc       = round(p["correct"] / p["answered"] * 100) if p["answered"] else 0
+        skills_in_test = ["DSA", "OOPs", "Python", "SQL", "DevOps"]
+        skill_scores   = {sk: {"correct": 0, "total": 0} for sk in skills_in_test}
+        for a in answers.values():
+            sk = a["skill"]
+            if sk in skill_scores:
+                skill_scores[sk]["total"] += 1
+                if a["is_correct"]:
+                    skill_scores[sk]["correct"] += 1
+
+        cols = st.columns(5)
+        SKILL_COLORS = {
+            "DSA": "#4f46e5", "OOPs": "#7c3aed", "Python": "#16a34a",
+            "SQL": "#d97706", "DevOps": "#dc2626"
+        }
+        for col, sk in zip(cols, skills_in_test):
+            s     = skill_scores[sk]
+            color = SKILL_COLORS.get(sk, "#4f46e5")
+            acc   = s["correct"] * 10
             with col:
                 st.markdown(f"""
                 <div class="metric-card" style="border-top-color:{color}">
-                    <div style="font-weight:800;font-size:0.95rem;color:#1e1b4b;margin-bottom:6px">{skill}</div>
-                    <div class="metric-val" style="color:{color}">{prof['score']:.1f}%</div>
-                    <div style="margin:6px 0">
-                        <span class="prof-pill" style="background:{bg};color:{color}">{prof['label']}</span>
-                    </div>
-                    <div class="theta-display">θ = {p['theta']:+.3f}</div>
-                    <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px">
-                        {p['correct']}/{p['answered']} correct ({acc}%)</div>
+                    <div style="font-weight:700;font-size:0.9rem;color:#1e1b4b;margin-bottom:6px">{sk}</div>
+                    <div class="metric-val" style="color:{color}">{s['correct']}/{s['total']}</div>
+                    <div style="font-size:0.75rem;color:#94a3b8;margin-top:4px">{acc}% accuracy</div>
                 </div>""", unsafe_allow_html=True)
 
-        st.markdown("")
+        st.markdown('<div class="content-card">', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">Question Review</div>', unsafe_allow_html=True)
+        for i, q in enumerate(st.session_state.test_questions):
+            ans        = answers.get(q["question_id"], {})
+            is_correct = ans.get("is_correct", False)
+            icon       = "✅" if is_correct else "❌"
+            selected   = ans.get("selected", "?")
+            correct    = q["correct_option"]
+            with st.expander(f"{icon} Q{i+1} · {q['skill']} · {q['question_text'][:60]}..."):
+                st.markdown(f"**Question:** {q['question_text']}")
+                options = {"a": q["option_a"], "b": q["option_b"],
+                           "c": q["option_c"], "d": q["option_d"]}
+                for k, v in options.items():
+                    if k == correct and k == selected:
+                        st.markdown(f"**{k.upper()}. {v}** ✅ (your answer — correct)")
+                    elif k == correct:
+                        st.markdown(f"**{k.upper()}. {v}** ✅ (correct answer)")
+                    elif k == selected:
+                        st.markdown(f"~~{k.upper()}. {v}~~ ❌ (your answer)")
+                    else:
+                        st.markdown(f"{k.upper()}. {v}")
+                if q.get("explanation"):
+                    st.info(q["explanation"])
+        st.markdown('</div>', unsafe_allow_html=True)
+
         col_a, col_b = st.columns(2)
         with col_a:
             if st.button("🏆 View Leaderboard", type="primary", use_container_width=True):
-                st.session_state.mcq_stage = "leaderboard"; st.rerun()
+                st.session_state.test_stage = "leaderboard"; st.rerun()
         with col_b:
-            if st.button("↺ Start New Session", use_container_width=True):
-                reset_mcq_session(); st.rerun()
-
-    # ── MCQ LEADERBOARD ───────────────────────────────────────────────────────
-    elif mcq_stage == "leaderboard":
-        st.markdown("""
-        <div class="page-banner-mcq">
-            <h1>🏆 Leaderboard</h1>
-            <p>Ranked by Rasch θ · Accounts for question difficulty · Fair cross-student comparison</p>
-        </div>""", unsafe_allow_html=True)
-
-        col_ref, col_btn = st.columns([5, 1])
-        with col_btn:
-            if st.button("🔄 Refresh", use_container_width=True):
+            if st.button("↺ Retake Test", use_container_width=True):
+                for k, v in _test_defaults.items():
+                    st.session_state[k] = v
                 st.rerun()
 
-        current_sid  = st.session_state.session_id
-        overall_lb   = db.get_overall_leaderboard()
-        skill_lb_all = db.get_all_skills_leaderboard()
-        skills       = db.get_skills()
+    # ── TEST LEADERBOARD ──────────────────────────────────────────────────────
+    elif test_stage == "leaderboard":
+        st.markdown("""
+        <div class="page-banner-mcq">
+            <h1>🏆 Test Leaderboard</h1>
+            <p>Ranked by correct answers · Ties broken by completion time</p>
+        </div>""", unsafe_allow_html=True)
 
-        if not overall_lb:
-            st.info("No completed sessions yet. Be the first to take the assessment!")
+        if st.button("🔄 Refresh", use_container_width=True):
+            st.rerun()
+
+        lb          = test_db.get_test_leaderboard()
+        current_sid = str(st.session_state.test_session_id or "")
+
+        if not lb:
+            st.info("No completed tests yet.")
             st.stop()
 
-        thetas = [float(r["theta_overall"]) for r in overall_lb]
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("👥 Students",  len(overall_lb))
-        c2.metric("📊 Avg θ",    f"{sum(thetas)/len(thetas):+.3f}")
-        c3.metric("🥇 Best θ",   f"{max(thetas):+.3f}")
-        c4.metric("📉 Lowest θ", f"{min(thetas):+.3f}")
+        scores = [r["total_correct"] for r in lb]
+        c1, c2 = st.columns(2)
+        c1.metric("👥 Students", len(lb))
+        c2.metric("🥇 Top score", f"{max(scores)}/10")
 
-        st.markdown("---")
+        MEDALS  = {1: "🥇", 2: "🥈", 3: "🥉"}
+        ROW_CLS = {1: "gold", 2: "silver", 3: "bronze"}
+
         st.markdown('<div class="card">', unsafe_allow_html=True)
-        st.markdown('<div class="section-label">Overall Ranking</div>', unsafe_allow_html=True)
-        render_lb_rows(overall_lb, current_sid)
+        st.markdown('<div class="section-label">Rankings</div>', unsafe_allow_html=True)
+        for r in lb:
+            rank      = int(r["rank"])
+            medal     = MEDALS.get(rank, "")
+            row_cls   = ROW_CLS.get(rank, "")
+            is_me     = str(r.get("session_id", "")) == current_sid
+            me_cls    = " is-me" if is_me else ""
+            you       = '<span class="lb-you">you</span>' if is_me else ""
+            correct   = int(r["total_correct"])
+            pct       = correct * 10
+            bar_color = "#16a34a" if pct >= 70 else ("#d97706" if pct >= 50 else "#dc2626")
+            st.markdown(f"""
+            <div class="lb-row {row_cls}{me_cls}">
+                <div style="font-size:1.2rem;min-width:28px">{medal}</div>
+                <div style="font-family:'DM Mono',monospace;font-size:0.78rem;
+                            color:#94a3b8;min-width:26px">#{rank}</div>
+                <div style="flex:1">
+                    <div class="lb-name">{html_module.escape(str(r['student_name']))}{you}</div>
+                    <div style="background:#e0e7ff;border-radius:999px;height:5px;
+                                margin-top:6px;width:180px;overflow:hidden">
+                        <div style="width:{pct}%;height:5px;background:{bar_color};
+                                    border-radius:999px"></div>
+                    </div>
+                </div>
+                <div style="text-align:right">
+                    <span style="font-size:1.1rem;font-weight:800;color:{bar_color}">{correct}/10</span>
+                    <div style="font-size:0.75rem;color:#94a3b8;margin-top:2px">{pct}%</div>
+                </div>
+            </div>""", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-        st.markdown('<div class="section-label">Skill-wise Ranking</div>', unsafe_allow_html=True)
-        skill_tabs = st.tabs(skills)
-        for tab, skill in zip(skill_tabs, skills):
-            with tab:
-                rows = skill_lb_all.get(skill, [])
-                if not rows:
-                    st.info(f"No submissions for {skill} yet.")
-                else:
-                    my_row = next(
-                        (r for r in rows if str(r.get("session_id","")) == str(current_sid or "")),
-                        None)
-                    if my_row:
-                        mcolor, mbg = PROF_COLORS.get(my_row["proficiency_label"], ("#4f46e5","#eef2ff"))
-                        st.markdown(
-                            f'<div style="background:{mbg};border-radius:10px;'
-                            f'padding:10px 16px;margin-bottom:12px;color:{mcolor};font-weight:700">'
-                            f'Your rank in {skill}: #{my_row["skill_rank"]} · '
-                            f'θ = {my_row["theta_final"]:+.3f} · {my_row["proficiency_label"]}'
-                            f'</div>', unsafe_allow_html=True)
-                    render_lb_rows(rows)
-
+        if st.button("← Back to Results", use_container_width=True):
+            st.session_state.test_stage = "results"; st.rerun()

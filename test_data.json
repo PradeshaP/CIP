@@ -1,0 +1,124 @@
+{
+  "questions": [
+    {
+      "question_id": "test_dsa_01",
+      "skill": "DSA",
+      "display_order": 1,
+      "question_text": "What is the time complexity of binary search on a sorted array of n elements?",
+      "option_a": "O(n)",
+      "option_b": "O(log n)",
+      "option_c": "O(n log n)",
+      "option_d": "O(1)",
+      "correct_option": "b",
+      "explanation": "Binary search halves the search space each step, giving O(log n)."
+    },
+    {
+      "question_id": "test_dsa_02",
+      "skill": "DSA",
+      "display_order": 2,
+      "question_text": "Which data structure uses LIFO (Last In First Out) order?",
+      "option_a": "Queue",
+      "option_b": "Linked List",
+      "option_c": "Stack",
+      "option_d": "Heap",
+      "correct_option": "c",
+      "explanation": "A stack follows LIFO — the last element pushed is the first popped."
+    },
+    {
+      "question_id": "test_oops_01",
+      "skill": "OOPs",
+      "display_order": 3,
+      "question_text": "Which OOP principle allows a subclass to provide a specific implementation of a method already defined in its superclass?",
+      "option_a": "Encapsulation",
+      "option_b": "Abstraction",
+      "option_c": "Inheritance",
+      "option_d": "Method overriding",
+      "correct_option": "d",
+      "explanation": "Method overriding lets a subclass redefine a parent method with its own implementation."
+    },
+    {
+      "question_id": "test_oops_02",
+      "skill": "OOPs",
+      "display_order": 4,
+      "question_text": "What does the 'private' access modifier mean in OOP?",
+      "option_a": "Accessible only within the same package",
+      "option_b": "Accessible from any class",
+      "option_c": "Accessible only within the same class",
+      "option_d": "Accessible from subclasses only",
+      "correct_option": "c",
+      "explanation": "Private restricts access to within the declaring class only — core to encapsulation."
+    },
+    {
+      "question_id": "test_python_01",
+      "skill": "Python",
+      "display_order": 5,
+      "question_text": "What does the 'with' statement do in Python?",
+      "option_a": "Defines a function",
+      "option_b": "Manages context — opens and auto-closes resources",
+      "option_c": "Creates a while loop",
+      "option_d": "Imports a module",
+      "correct_option": "b",
+      "explanation": "'with' uses context managers to ensure resources like files are properly closed."
+    },
+    {
+      "question_id": "test_python_02",
+      "skill": "Python",
+      "display_order": 6,
+      "question_text": "Which of the following creates a generator in Python?",
+      "option_a": "def f(): return []",
+      "option_b": "def f(): yield value",
+      "option_c": "lambda x: x",
+      "option_d": "class F: pass",
+      "correct_option": "b",
+      "explanation": "Using 'yield' instead of 'return' makes a function a generator."
+    },
+    {
+      "question_id": "test_sql_01",
+      "skill": "SQL",
+      "display_order": 7,
+      "question_text": "Which SQL clause is used to filter groups after a GROUP BY?",
+      "option_a": "WHERE",
+      "option_b": "FILTER",
+      "option_c": "HAVING",
+      "option_d": "ORDER BY",
+      "correct_option": "c",
+      "explanation": "HAVING filters aggregated results after GROUP BY; WHERE filters rows before grouping."
+    },
+    {
+      "question_id": "test_sql_02",
+      "skill": "SQL",
+      "display_order": 8,
+      "question_text": "What type of JOIN returns all rows from both tables, with NULLs where there is no match?",
+      "option_a": "INNER JOIN",
+      "option_b": "LEFT JOIN",
+      "option_c": "RIGHT JOIN",
+      "option_d": "FULL OUTER JOIN",
+      "correct_option": "d",
+      "explanation": "FULL OUTER JOIN returns all rows from both tables, filling NULLs where no match exists."
+    },
+    {
+      "question_id": "test_devops_01",
+      "skill": "DevOps",
+      "display_order": 9,
+      "question_text": "In Docker, what is the purpose of a Dockerfile?",
+      "option_a": "To manage container networking",
+      "option_b": "To define instructions for building a Docker image",
+      "option_c": "To run multiple containers simultaneously",
+      "option_d": "To store container logs",
+      "correct_option": "b",
+      "explanation": "A Dockerfile is a script of instructions that Docker uses to build an image."
+    },
+    {
+      "question_id": "test_devops_02",
+      "skill": "DevOps",
+      "display_order": 10,
+      "question_text": "Which Git command creates a new branch and switches to it in one step?",
+      "option_a": "git branch new-branch",
+      "option_b": "git switch new-branch",
+      "option_c": "git checkout -b new-branch",
+      "option_d": "git merge new-branch",
+      "correct_option": "c",
+      "explanation": "'git checkout -b' creates and switches to the new branch in one command."
+    }
+  ]
+}

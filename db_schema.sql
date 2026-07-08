@@ -164,6 +164,43 @@ CREATE TABLE IF NOT EXISTS final_sessions (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     completed_at TIMESTAMP WITH TIME ZONE
 );
+-- Fixed MCQ Test tables
+CREATE TABLE IF NOT EXISTS test_questions (
+    question_id VARCHAR(50) PRIMARY KEY,
+    skill VARCHAR(100) NOT NULL,
+    question_text TEXT NOT NULL,
+    option_a TEXT NOT NULL,
+    option_b TEXT NOT NULL,
+    option_c TEXT NOT NULL,
+    option_d TEXT NOT NULL,
+    correct_option CHAR(1) NOT NULL CHECK (correct_option IN ('a','b','c','d')),
+    explanation TEXT,
+    display_order INT NOT NULL,
+    is_active BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE IF NOT EXISTS test_sessions (
+    session_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_name VARCHAR(200) NOT NULL,
+    student_email VARCHAR(200) NOT NULL,
+    total_score INT DEFAULT 0,
+    total_correct INT DEFAULT 0,
+    status VARCHAR(20) DEFAULT 'active',
+    started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE TABLE IF NOT EXISTS test_responses (
+    response_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID NOT NULL,
+    question_id VARCHAR(50) NOT NULL,
+    skill VARCHAR(100) NOT NULL,
+    selected_option CHAR(1),
+    is_correct BOOLEAN NOT NULL,
+    answered_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_test_responses_session ON test_responses(session_id);
 
 CREATE INDEX IF NOT EXISTS idx_final_sessions_oe_session ON final_sessions(oe_session_id);
 CREATE INDEX IF NOT EXISTS idx_final_sessions_mcq_session ON final_sessions(mcq_session_id);
